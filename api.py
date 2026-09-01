@@ -41,6 +41,7 @@ class ServerConfig:
     model_api_key: Optional[str] = None  # key the model call uses (config/env resolved)
     subagents: bool = False
     cors_origins: list[str] = field(default_factory=lambda: ["*"])
+    models: tuple[str, ...] = ()    # curated model ids from the config entry
 
 
 # ---------------------------------------------------------------------------
@@ -116,8 +117,14 @@ def create_app(config: ServerConfig) -> FastAPI:
 
     def build_agent(request: ChatRequest) -> tuple[Harness, str]:
         """Replay the posted history into a fresh agent; return it and the query."""
+        model = request.model or config.model
+        if request.model and config.models and request.model not in config.models:
+            raise HTTPException(
+                status_code=400,
+                detail=f"unknown model {request.model!r}. Available: "
+                       f"{', '.join(config.models)}")
         agent = Harness(
-            model=request.model or config.model,
+            model=model,
             workspace=config.workspace,
             base_url=config.base_url,
             max_steps=request.max_steps if request.max_steps is not None else config.max_steps,
@@ -155,14 +162,15 @@ def create_app(config: ServerConfig) -> FastAPI:
     @app.get("/v1/models")
     def models(authorization: Optional[str] = Header(None)) -> dict[str, Any]:
         authorize(authorization)
+        ids = list(config.models) or [config.model]
         return {
             "object": "list",
             "data": [{
-                "id": config.model,
+                "id": model_id,
                 "object": "model",
                 "created": int(time.time()),
                 "owned_by": "ollama-harness",
-            }],
+            } for model_id in ids],
         }
 
     @app.post("/v1/chat/completions")

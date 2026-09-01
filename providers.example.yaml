@@ -2,33 +2,46 @@
 # --provider NAME (e.g. `harness --provider openrouter`). Without --provider
 # the harness always uses ollama, configured from .env.
 #
-# Copy this file to `providers.yaml` in your working directory (or
-# ~/.config/harness/providers.yaml, %APPDATA%\harness\providers.yaml) and fill
-# in your values. `harness init-provider` creates it interactively; this file
-# is the reference template.
+# Copy this file to the harness config location and fill in your values:
+# %APPDATA%\harness\providers.yaml (Windows) or
+# ~/.config/harness/providers.yaml (other platforms).
+# `harness init-provider` creates it for you; this file is the reference template.
 #
 # Fields per provider:
 #   base_url   API endpoint (required)
 #   api_key    secret for that service (leave out to use env vars instead)
-#   model      default model id (can be overridden with --model per run)
+#   default    the provider's default model id — the harness uses this unless
+#              --model is given (a legacy `model:` key is accepted as an alias)
+#   models     optional curated list of model ids: --model must pick one of
+#              them (the first is the default when `default` is absent);
+#              leave out to allow any id
 #   kind       wire protocol: openai (default for custom names), ollama,
 #              or openrouter. A name that matches a built-in inherits it.
 #   num_ctx    context window (ollama only)
 #
 # The default provider (no --provider) is ALWAYS ollama.
+#
+# Manage providers/models from the command line:
+#   harness init-provider ...                      create a provider
+#   harness --provider openrouter --add <id>       append to the models list
+#   harness --provider openrouter --set-default <id>   replace the default field
 
 providers:
   openrouter:
     base_url: https://openrouter.ai/api/v1
     api_key: sk-or-v1-xxxxxxxxxxxxxxxx
-    model: openai/gpt-5.5
+    models:
+      - openai/gpt-5.5
+      - deepseek/deepseek-chat
+      - anthropic/claude-sonnet-4
+    default: deepseek/deepseek-chat
 
   # groq:
   #   base_url: https://api.groq.com/openai/v1
   #   api_key: gsk_xxxxxxxxxxxxxxxx
-  #   model: llama-3.3-70b-versatile
+  #   default: llama-3.3-70b-versatile
 
   # local:
   #   kind: ollama
   #   base_url: http://127.0.0.1:11434
-  #   model: qwen3
+  #   default: qwen3

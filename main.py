@@ -25,8 +25,8 @@ from rich.table import Table
 
 from harness import RETRY_LIMIT, MODES, Harness, console, normalize_base_url
 from providers import (DEFAULT_BASE_URLS, DEFAULT_MODELS, DEFAULT_NUM_CTX,
-                       PROVIDERS, Provider, find_config, load_config,
-                       resolve_provider)
+                       PROVIDERS, Provider, default_config_path, find_config,
+                       load_config, resolve_provider)
 
 VERSION = "0.2.0"
 COMMANDS = ("chat", "serve", "init-provider")
@@ -113,15 +113,23 @@ def run_init_provider(args: argparse.Namespace) -> None:
 
     console.print("[bold]Initialize a provider in providers.yaml[/bold]")
     path = (Path(args.config).expanduser() if args.config
-            else find_config(None) or Path.cwd() / "providers.yaml")
+            else find_config(None) or default_config_path())
 
-    # Fully flagged runs (--name + --base-url) skip every prompt; otherwise ask.
-    full = bool(args.name and args.base_url)
+    # Fully flagged runs (--name + --base-url, or --models) skip prompts.
+    full = bool((args.name and args.base_url) or args.models)
     name = args.name or _ask("provider name (alias)", "openrouter")
     base = args.base_url or _ask("base_url (API endpoint)",
                                  "https://openrouter.ai/api/v1")
-    model = args.model or (None if full else
-                           _ask("default model (override per run with --model)"))
+    if args.model and args.models:
+        console.print("[red]--model and --models are mutually exclusive — pass one[/red]")
+        sys.exit(1)
+    models = ([m.strip() for m in args.models.split(",") if m.strip()]
+              if args.models else None)
+    if models and any(not m for m in models):
+        console.print("[red]--models needs a comma-separated list of model ids[/red]")
+        sys.exit(1)
+    model = args.model or (None if (full or models)
+                           else _ask("default model (override per run with --model)"))
     # Built-in names inherit their protocol; custom names default to openai.
     if name in PROVIDERS:
         kind: str | None = None
@@ -140,9 +148,18 @@ def run_init_provider(args: argparse.Namespace) -> None:
             store = False
         api_key = _ask_secret("api_key (sk-…)") if store else None
 
+    # the default model becomes the entry's `default:` field; with only a
+    # models list, the first model is the default
+    if model:
+        default_model = model
+    elif models:
+        default_model = models[0]
+    else:
+        default_model = None
     entry = {
         k: v for k, v in build_provider_entry(
-            kind=kind, base_url=base, api_key=api_key, model=model).items()
+            kind=kind, base_url=base, api_key=api_key,
+            default_model=default_model, models=models).items()
         if v is not None
     }
     try:
@@ -152,7 +169,115 @@ def run_init_provider(args: argparse.Namespace) -> None:
         sys.exit(1)
     add_provider_to_config(path, name, entry)
     console.print(f"[green]wrote {name!r} to {path}[/green]")
-    console.print(f"use it with: [bold]harness --provider {name}[/bold] (or --model to override)")
+    console.print(f"use it with: [bold]harness --provider {name}[/bold] "
+                  f"(defaults to {default_model or 'the first model'}; "
+                  f"--model overrides per run)")
+
+
+def run_add_model(args: argparse.Namespace) -> None:
+    """`harness --provider NAME --add MODEL` — add a model to the provider's
+    models list in providers.yaml, then exit. The first model in the list stays
+    the default; the entry is created if the provider is not defined yet (a
+    built-in then keeps its default endpoint and key)."""
+    from providers import load_config
+
+    if not args.provider:
+        console.print("[red]--add needs --provider NAME (e.g. "
+                      "--provider openrouter --add deepseek/deepseek-v4-flash-0731)[/red]")
+        sys.exit(1)
+    path = (Path(args.config).expanduser() if args.config
+            else find_config(None) or default_config_path())
+
+    entries: dict[str, dict] = {}
+    if path.is_file():
+        try:
+            entries = load_config(path).get("providers", {})
+        except ValueError as e:
+            console.print(f"[red]{e}[/red]")
+            sys.exit(1)
+
+    entry = dict(entries.get(args.provider) or {})
+    models = list(entry.get("models") or [])
+    if not models and (entry.get("default") or entry.get("model")):
+        # a lone default becomes the first entry of the new list
+        models = [entry.get("default") or entry["model"]]
+    if args.add in models:
+        console.print(f"[yellow]{args.add} is already in {args.provider}'s models[/yellow]")
+        return
+    models.append(args.add)
+    entry["models"] = models
+
+    try:
+        resolve_provider(args.provider, config={"providers": {args.provider: entry}})
+    except ValueError as e:
+        console.print(f"[red]cannot add: {e}[/red]")
+        sys.exit(1)
+
+    add_provider_to_config(path, args.provider, entry)
+    console.print(f"[green]added {args.add} to provider {args.provider} ({path})[/green]")
+    if args.provider not in PROVIDERS and not entry.get("base_url"):
+        console.print("[dim]this provider has no base_url — set one in the YAML "
+                      "or re-run with harness init-provider[/dim]")
+    console.print(f"use it with: [bold]harness --provider {args.provider} "
+                  f"--model {args.add}[/bold]")
+
+
+def run_set_default_model(args: argparse.Namespace) -> None:
+    """`harness --provider NAME --set-default MODEL` — set the provider's
+    default model in providers.yaml, then exit.
+
+    Replaces the entry's `default:` field with the given id and leaves the
+    `models:` list untouched (the schema keeps them separate: `models:` is the
+    available set, `default:` is which one the harness uses). The provider
+    entry is created if not defined yet.
+    """
+    from providers import load_config
+
+    if not args.provider:
+        console.print("[red]--set-default needs --provider NAME (e.g. "
+                      "--provider openrouter --set-default "
+                      "deepseek/deepseek-v4-flash-0731)[/red]")
+        sys.exit(1)
+    if not args.set_default:
+        console.print("[red]--set-default needs a model id[/red]")
+        sys.exit(1)
+    new = args.set_default
+    path = (Path(args.config).expanduser() if args.config
+            else find_config(None) or default_config_path())
+
+    entries: dict[str, dict] = {}
+    if path.is_file():
+        try:
+            entries = load_config(path).get("providers", {})
+        except ValueError as e:
+            console.print(f"[red]{e}[/red]")
+            sys.exit(1)
+
+    entry = dict(entries.get(args.provider) or {})
+    entry["default"] = new
+    entry.pop("model", None)   # legacy alias superseded by the default field
+    models = entry.get("models")
+    if models and new not in models:
+        console.print(f"[yellow]note: {new} is not in {args.provider}'s models "
+                      f"list — add it with --add, or it will only be the default[/yellow]")
+    # deterministic key order in the written file (unknown keys preserved)
+    ordered = {k: entry[k] for k in ("kind", "base_url", "api_key", "default",
+                                     "models", "num_ctx") if k in entry}
+    entry = {**ordered, **{k: v for k, v in entry.items() if k not in ordered}}
+
+    try:
+        resolve_provider(args.provider, config={"providers": {args.provider: entry}})
+    except ValueError as e:
+        console.print(f"[red]cannot set default: {e}[/red]")
+        sys.exit(1)
+
+    add_provider_to_config(path, args.provider, entry)
+    console.print(f"[green]default model for {args.provider} is now {new} ({path})[/green]")
+    if args.provider not in PROVIDERS and not entry.get("base_url"):
+        console.print("[dim]this provider has no base_url — set one in the YAML "
+                      "or re-run with harness init-provider[/dim]")
+    console.print(f"use it with: [bold]harness --provider {args.provider}[/bold] "
+                  f"(defaults to {new}; --model overrides per run)")
 
 
 def provider_config(args: argparse.Namespace) -> tuple[Provider, Path | None]:
@@ -178,6 +303,17 @@ def provider_config(args: argparse.Namespace) -> tuple[Provider, Path | None]:
     except ValueError as e:
         console.print(f"[red]{e}[/red]")
         sys.exit(1)
+    if args.provider and cfg_path is None:
+        # --provider given but no providers.yaml found anywhere: the harness
+        # silently used built-in defaults (which have no key) — say so loudly.
+        console.print(
+            "[yellow]no providers.yaml found — using built-in defaults for "
+            f"{args.provider!r} (no api key)[/yellow]\n"
+            "  checked: $HARNESS_CONFIG, %APPDATA%\\harness\\providers.yaml,\n"
+            "           ~/.config/harness/providers.yaml\n"
+            "  fix:     put your providers.yaml in one of those places, or run\n"
+            f"           [bold]harness --provider {args.provider} "
+            "--config PATH[/bold]")
     return prov, cfg_path
 
 
@@ -222,9 +358,9 @@ def common_args(parser: argparse.ArgumentParser) -> None:
                         help="provider: ollama is the default; pick openai, "
                              "openrouter, or a name from providers.yaml")
     parser.add_argument("--config", metavar="PATH", default=None,
-                        help="providers.yaml (default: $HARNESS_CONFIG, ./providers.yaml, "
-                             "~/.config/harness/providers.yaml, or the platform app-data "
-                             "dir under harness/providers.yaml)")
+                        help="providers.yaml (default: $HARNESS_CONFIG, "
+                             "then %APPDATA%\\harness\\providers.yaml or "
+                             "~/.config/harness/providers.yaml)")
     parser.add_argument("--model", default=None,
                         help=f"model id (overrides the config default, e.g. {DEFAULT_MODELS['ollama']})")
     parser.add_argument("--base-url", default=None,
@@ -242,6 +378,13 @@ def common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--retry-limit", type=int, default=RETRY_LIMIT,
                         help="consecutive tool failures before a task is abandoned")
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--add", default=None, metavar="MODEL_ID",
+                        help="add this model id to --provider's models list in "
+                             "providers.yaml, then exit (with --provider NAME)")
+    parser.add_argument("--set-default", default=None, metavar="MODEL_ID",
+                        help="set --provider's default model in providers.yaml "
+                             "(replaces the existing model: field), then exit "
+                             "(with --provider NAME)")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -278,10 +421,12 @@ def build_parser() -> argparse.ArgumentParser:
     initp = sub.add_parser("init-provider",
                            help="interactively add a provider to providers.yaml")
     initp.add_argument("--config", metavar="PATH", default=None,
-                       help="target file (default: ./providers.yaml or the default locations)")
+                       help="target file (default: the harness config location)")
     initp.add_argument("--name", default=None, help="provider alias (default: prompted)")
     initp.add_argument("--base-url", default=None, help="API endpoint (default: prompted)")
     initp.add_argument("--model", default=None, help="default model (default: prompted)")
+    initp.add_argument("--models", default=None, metavar="ID1,ID2,...",
+                       help="curated model list (mutually exclusive with --model)")
     initp.add_argument("--kind", default=None, help="wire protocol (default: openai)")
     initp.add_argument("--api-key", default=None, help="store this key in the file")
     return parser
@@ -298,15 +443,6 @@ def resolve_workspace(raw: str) -> Path:
 def install_hint(provider: str) -> str:
     return ("uv pip install langchain-openai" if provider != "ollama"
             else "uv pip install langchain-ollama")
-
-
-def print_tools(agent: Harness) -> None:
-    table = Table(title=f"tools ({len(agent.tools)})", show_lines=False)
-    table.add_column("name", style="yellow")
-    table.add_column("description", style="dim")
-    for tool in agent.tools:
-        table.add_row(tool.name, tool.description)
-    console.print(table)
 
 
 def print_stats(agent: Harness) -> None:
@@ -334,7 +470,7 @@ def make_agent(args: argparse.Namespace, workspace: Path, prov: Provider,
             mode=args.mode, temperature=prov.temperature,
             num_ctx=prov.num_ctx, provider=prov.name, api_key=prov.api_key,
             show_results=args.show_results, stream=stream,
-            subagents=args.subagents,
+            subagents=args.subagents, models=prov.models,
         )
     except ImportError:
         console.print(f"[red]missing dependency:[/red] {install_hint(prov.name)}")
@@ -345,13 +481,19 @@ def startup_panel(prov: Provider, base_url: str, workspace: Path,
                   mode: str, tools: int, subagents: bool,
                   key_set: bool, cfg_path: Path | None,
                   stream: bool = True) -> None:
+    choices = ""
+    if len(prov.models) > 1:
+        shown = ", ".join(prov.models[:4])
+        more = f" … (+{len(prov.models) - 4})" if len(prov.models) > 4 else ""
+        choices = f"\nmodels [bold]{shown}{more}[/bold]  (switch with /model)"
     console.print(Panel.fit(
         f"[bold]{provider_label(prov)}[/bold] · model [bold]{prov.model}[/bold] @ {base_url}\n"
         f"context [bold]{prov.num_ctx:,}[/bold] · workspace [bold]{workspace}[/bold]\n"
         f"mode [bold]{mode}[/bold] · {tools} tools"
         f"{'  ·  sub-agents [bold]on[/bold]' if subagents else ''}"
         f"{'  ·  config [dim]' + str(cfg_path) + '[/dim]' if cfg_path else ''}"
-        f"{'  ·  [yellow]no api key[/yellow]' if prov.name != 'ollama' and not key_set else ''}",
+        f"{'  ·  [yellow]no api key[/yellow]' if prov.name != 'ollama' and not key_set else ''}"
+        f"{choices}",
         title="ollama-harness", border_style="green",
     ))
 
@@ -367,7 +509,6 @@ def run_chat(args: argparse.Namespace) -> None:
     startup_panel(prov, base_url, workspace, args.mode,
                   len(agent.tools), agent.subagents,
                   prov.api_key is not None, cfg_path, stream)
-    print_tools(agent)
 
     if args.file:
         task = read_prompt_file(args.file)
@@ -386,7 +527,8 @@ def run_chat(args: argparse.Namespace) -> None:
             fill = (agent.context_used / agent.num_ctx * 100) if agent.num_ctx else 0
             gauge = f"[dim] {fill:.0f}%[/dim]" if agent.context_used else ""
             line = console.input(
-                f"\n[bold magenta]{agent.mode}[/bold magenta]{gauge}[bold magenta]> [/bold magenta]").strip()
+                f"\n[bold magenta]{agent.model}[/bold magenta]"
+                f"[dim] {agent.mode}[/dim]{gauge}[bold magenta]> [/bold magenta]").strip()
         except (EOFError, KeyboardInterrupt):
             break
         if not line:
@@ -408,6 +550,22 @@ def run_chat(args: argparse.Namespace) -> None:
                 agent.set_subagents(not agent.subagents)
                 console.print(f"[dim]sub-agents: {'on' if agent.subagents else 'off'}[/dim]")
                 continue
+            if cmd == "models":
+                if agent.models:
+                    console.print(f"[dim]available models:[/dim] "
+                                  + ", ".join(agent.models))
+                else:
+                    console.print("[dim]this provider lists no curated models — "
+                                  "--model accepts any id[/dim]")
+                continue
+            if cmd.startswith("model ") and cmd.strip() != "model":
+                name = cmd.split(None, 1)[1].strip().strip('"').strip("'")
+                err = agent.set_model(name)
+                if err:
+                    console.print(f"[yellow]{err}[/yellow]")
+                else:
+                    console.print(f"[dim]model: {name}[/dim]")
+                continue
             if cmd == "stats":
                 print_stats(agent)
                 continue
@@ -417,6 +575,8 @@ def run_chat(args: argparse.Namespace) -> None:
                     '  /file <path>  run a task from a file\n'
                     '  /allow /ask /deny  switch permission mode\n'
                     '  /subagents  toggle the spawn_agent tool\n'
+                    '  /models  list this provider\'s curated models\n'
+                    '  /model <id>  switch model mid-session\n'
                     '  /stats  session context, steps, tokens\n'
                     '  /reset  clear conversation history\n'
                     '  /quit (or q)  exit[/dim]')
@@ -452,7 +612,7 @@ def run_serve(args: argparse.Namespace) -> None:
         model=prov.model, base_url=base_url, workspace=workspace, mode=args.mode,
         num_ctx=prov.num_ctx, max_steps=args.max_steps, retry_limit=args.retry_limit,
         provider=prov.name, api_key=auth_key, model_api_key=model_key,
-        cors_origins=args.cors_origins or ["*"],
+        cors_origins=args.cors_origins or ["*"], models=prov.models,
     ))
 
     keyed = prov.api_key is not None or auth_key is not None
@@ -479,7 +639,11 @@ def main(argv: list[str] | None = None) -> None:
     if not argv or argv[0] not in COMMANDS and argv[0] not in ("-h", "--help", "--version"):
         argv.insert(0, "chat")   # bare invocation, flags, or a query all mean chat
     args = build_parser().parse_args(argv)
-    if args.command == "init-provider":
+    if args.add is not None:
+        run_add_model(args)
+    elif args.set_default is not None:
+        run_set_default_model(args)
+    elif args.command == "init-provider":
         run_init_provider(args)
     else:
         (run_serve if args.command == "serve" else run_chat)(args)

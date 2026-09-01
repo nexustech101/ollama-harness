@@ -18,22 +18,35 @@ name inherits that protocol; any other name defaults to `openai` unless the
 entry sets `kind`.
 
 Config file locations, first match wins: --config, $HARNESS_CONFIG,
-./providers.yaml, ~/.config/harness/providers.yaml, %APPDATA%/harness/providers.yaml.
+%APPDATA%/harness/providers.yaml (or ~/.config/harness/providers.yaml).
+The current directory is not searched: the config belongs to the harness, so
+the same providers are available from any directory.
 
     # providers.yaml — consulted only when --provider NAME is used
     providers:
       openrouter:
         base_url: https://openrouter.ai/api/v1
         api_key: sk-or-v1-xxxx
-        model: openai/gpt-5.5
+        models:
+          - qwen/qwen3.8-27b
+          - deepseek/deepseek-v4-flash-0731
+        default: deepseek/deepseek-v4-flash-0731   # the provider's default model
       groq:
         base_url: https://api.groq.com/openai/v1
         api_key: gsk_xxxx
-        model: llama-3.3-70b-versatile
+        default: llama-3.3-70b-versatile
       local:
         kind: ollama                       # optional; defaults to openai
         base_url: http://127.0.0.1:11434
-        model: qwen3
+        default: qwen3
+
+A provider entry's default model is its `default:` field; the harness uses it
+unless --model is given. `models:` is an optional curated list — --model must
+pick one of them (its first entry is the default when `default:` is absent).
+A legacy `model:` key is accepted as an alias for `default:`. You can grow the
+list and change the default from the command line:
+  harness --provider openrouter --add <model-id>
+  harness --provider openrouter --set-default <model-id>
 """
 
 from __future__ import annotations
@@ -47,7 +60,7 @@ import yaml  # PyYAML (declared dependency; also shipped by langchain-core)
 from langchain_core.language_models.chat_models import BaseChatModel
 
 PROVIDERS = ("ollama", "openai", "openrouter")
-DEFAULT_NUM_CTX = 200_000  # single source of truth for the default context window
+DEFAULT_NUM_CTX = 1_00_000  # single source of truth for the default context window
 
 # Per-provider defaults, overridable by flags / config / env vars.
 DEFAULT_BASE_URLS = {
@@ -88,19 +101,25 @@ def _first(*values: Any) -> Any:
 # YAML config file
 # ---------------------------------------------------------------------------
 
+def default_config_path() -> Path:
+    """Where the harness-level providers.yaml lives (created there if missing)."""
+    if os.name == "nt" and os.environ.get("APPDATA"):
+        return Path(os.environ["APPDATA"]) / "harness" / "providers.yaml"
+    return Path.home() / ".config" / "harness" / "providers.yaml"
+
+
 def find_config(explicit: Optional[str] = None) -> Optional[Path]:
-    """Locate the providers YAML: --config, $HARNESS_CONFIG, cwd, user dirs."""
+    """Locate the harness providers.yaml: --config, then $HARNESS_CONFIG,
+    then the user-level harness config directory. The current directory is
+    never searched — the config belongs to the harness, not to wherever you
+    happen to run it."""
     candidates: list[Path] = []
     if explicit:
         candidates.append(Path(explicit).expanduser())
     env_path = os.environ.get("HARNESS_CONFIG")
     if env_path:
         candidates.append(Path(env_path).expanduser())
-    candidates.append(Path.cwd() / "providers.yaml")
-    candidates.append(Path.cwd() / "providers.yml")
-    if os.name == "nt" and os.environ.get("APPDATA"):
-        candidates.append(Path(os.environ["APPDATA"]) / "harness" / "providers.yaml")
-    candidates.append(Path.home() / ".config" / "harness" / "providers.yaml")
+    candidates.append(default_config_path())
     for candidate in candidates:
         if candidate.is_file():
             return candidate
@@ -131,6 +150,13 @@ def load_config(path: Path) -> dict[str, Any]:
         if not isinstance(opts, dict):
             raise ValueError(f"{path}: provider {name!r} must be a mapping "
                              f"of options (got {type(opts).__name__})")
+        models = opts.get("models")
+        if models is not None:
+            if not isinstance(models, list) or not all(
+                    isinstance(m, str) and m.strip() for m in models):
+                raise ValueError(f"{path}: provider {name!r} 'models' must be "
+                                 f"a list of model ids (got {models!r})")
+            opts = {**opts, "models": [m.strip() for m in models]}
         cleaned[str(name)] = {str(k): v for k, v in opts.items()}
     return {"providers": cleaned}
 
@@ -153,12 +179,16 @@ def provider_names(config: Optional[dict[str, Any]] = None) -> list[str]:
 
 def build_provider_entry(*, kind: Optional[str] = None, base_url: str,
                          api_key: Optional[str] = None,
-                         model: Optional[str] = None,
-                         num_ctx: Optional[int] = None) -> dict[str, Any]:
+                         default_model: Optional[str] = None,
+                         num_ctx: Optional[int] = None,
+                         models: Optional[list[str]] = None) -> dict[str, Any]:
     """Build a provider entry dict for the YAML config (None values dropped).
 
     ``kind`` may be omitted entirely — a name matching a built-in inherits that
-    protocol; any other name defaults to the openai protocol.
+    protocol; any other name defaults to the openai protocol. ``default_model``
+    is written as the entry's `default:` field; ``models`` is an optional
+    curated list (`--model` must pick one of them; the first is the default
+    when no `default:` is present).
     """
     entry: dict[str, Any] = {}
     if kind:
@@ -167,8 +197,10 @@ def build_provider_entry(*, kind: Optional[str] = None, base_url: str,
         entry["base_url"] = base_url
     if api_key:
         entry["api_key"] = api_key
-    if model:
-        entry["model"] = model
+    if default_model:
+        entry["default"] = default_model
+    if models:
+        entry["models"] = list(models)
     if num_ctx:
         entry["num_ctx"] = num_ctx
     return entry
@@ -190,6 +222,7 @@ class Provider:
     temperature: float = 0.0
     extra: dict[str, Any] = field(default_factory=dict)
     label: str = ""             # config alias or display name, when name is a family
+    models: tuple[str, ...] = ()  # curated model ids from the config entry (may be empty)
 
     @property
     def endpoint(self) -> str:
@@ -256,8 +289,21 @@ def resolve_provider(
     legacy_model_env = os.environ.get("OLLAMA_MODEL") if family == "ollama" else None
     legacy_base_env = os.environ.get("OLLAMA_HOST") if family == "ollama" else None
 
+    # Curated model list (optional) and its default.
+    spec_models: tuple[str, ...] = tuple(entry.get("models") or ()) if entry else ()
+    if model is not None and spec_models and model not in spec_models:
+        raise ValueError(
+            f"provider {wanted!r}: model {model!r} is not among its configured "
+            f"models: {', '.join(spec_models)}. Pick one of those, or remove "
+            f"the models list from the config to allow any id.")
+
+    # The default model is the entry's `default:` field ('model:' is accepted
+    # as a legacy alias); otherwise the first entry of `models:`.
+    entry_default = (entry.get("default") or entry.get("model")) if entry else None
+
     # Precedence per field: flag > config entry > env var > built-in default.
-    resolved_model = _first(model, entry.get("model") if entry else None,
+    resolved_model = _first(model, entry_default,
+                            spec_models[0] if spec_models else None,
                             os.environ.get("HARNESS_MODEL"), legacy_model_env,
                             DEFAULT_MODELS[family]) or DEFAULT_MODELS[family]
     resolved_base = _first(base_url, entry.get("base_url") if entry else None,
@@ -276,4 +322,5 @@ def resolve_provider(
         temperature=temperature if temperature is not None else 0.0,
         extra=extra,
         label=wanted if entry is not None else "",
+        models=spec_models,
     )

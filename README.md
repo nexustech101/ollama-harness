@@ -80,9 +80,11 @@ The file is **only read when `--provider` is passed**. Without `--provider` the
 harness uses ollama from `.env` and never touches the config. There is no
 `default` key: the default provider is always ollama.
 
-Search order (first match wins): `--config PATH`, `$HARNESS_CONFIG`,
-`./providers.yaml` in the launch directory, `~/.config/harness/providers.yaml`,
-`%APPDATA%\harness\providers.yaml`.
+Search order (first match wins): `--config PATH`, `$HARNESS_CONFIG`, then the
+harness config directory — `%APPDATA%\harness\providers.yaml` on Windows,
+`~/.config/harness/providers.yaml` elsewhere. The current directory is **not**
+searched: the config belongs to the harness, so the same providers work from
+any directory.
 
 ```yaml
 # providers.yaml
@@ -90,22 +92,65 @@ providers:
   openrouter:
     base_url: https://openrouter.ai/api/v1
     api_key: sk-or-v1-xxxxxxxxxxxxxxxx
-    model: openai/gpt-5.5
+    models:                     # the models available for this provider
+      - openai/gpt-5.5
+      - deepseek/deepseek-chat
+      - anthropic/claude-sonnet-4
+    default: deepseek/deepseek-chat   # the model the harness uses by default
   groq:
     base_url: https://api.groq.com/openai/v1   # custom names default to the
     api_key: gsk_xxxx                          # openai protocol (OpenAI-compatible)
-    model: llama-3.3-70b-versatile
+    default: llama-3.3-70b-versatile
     num_ctx: 16000
   local:
     kind: ollama                          # switch the wire protocol if needed
     base_url: http://127.0.0.1:11434
-    model: qwen3
+    default: qwen3
 ```
 
 ```bash
-harness --provider openrouter                    # config defaults: endpoint, key, model
-harness --provider openrouter --model openai/gpt-5.5   # override the model for this run
+harness --provider openrouter                    # uses the default: field
+harness --provider openrouter --model openai/gpt-5.5   # this run only
 harness --provider groq --config ~/code/providers.yaml
+```
+
+**The default model.** Each provider entry carries a `default:` field naming
+the model the harness uses when `--model` is not given. `--model <id>` overrides
+it for that run. A legacy `model:` key is accepted as an alias for `default:`.
+
+**Several models per provider.** Add a `models:` list (the available set) and
+`--model` must pick one of them — a bad id errors with the list; drop the
+`models` list to allow any id. Without a `default:` field the first entry is
+the default. In the REPL, `/models` lists the choices and `/model <id>` switches
+the live model mid-session. The API server advertises them too: `GET /v1/models`
+returns the curated list, and a request with `"model": "..."` must use one.
+
+**Add a model to a provider from the command line:**
+
+```bash
+harness --provider openrouter --add deepseek/deepseek-v4-flash-0731
+```
+
+This appends the model to that provider's `models:` list in `providers.yaml`
+(creating the provider entry if it isn't there yet). It writes the file and
+exits — nothing else runs. A duplicate id is a no-op. Use `--config PATH` to
+target a specific file.
+
+**Set the default model for a provider:**
+
+```bash
+harness --provider openrouter --set-default deepseek/deepseek-v4-flash-0731
+```
+
+The harness uses the provider's `default:` field unless you pass `--model <id>`,
+which overrides it for that run. `--set-default` writes the new default into
+`providers.yaml`, **replacing the `default:` field** — the `models:` list is
+left untouched. (If the new default isn't in the `models:` list yet, add it
+with `--add` or it will only be the default.)
+
+```bash
+harness --provider openrouter                       # uses the default model
+harness --provider openrouter --model openai/gpt-5.5   # this run only
 ```
 
 ### Initializing a provider from the command line
@@ -128,10 +173,12 @@ harness init-provider --name groq --base-url https://api.groq.com/openai/v1 \
   --api-key gsk_xxxx --model llama-3.3-70b-versatile
 ```
 
-Pass `--config PATH` to target a specific file (default: `./providers.yaml`).
+Pass `--config PATH` to target a specific file (default: the harness config
+location).
 Names that match a built-in (openrouter, openai, ollama) inherit its wire
 protocol; custom names (groq, …) default to the openai protocol unless you set
-`--kind`. The reference template ships as `providers.example.yaml`.
+`--kind`. Pass `--models id1,id2,...` instead of `--model` to write a curated
+model list. The reference template ships as `providers.example.yaml`.
 
 Precedence per field: **flag > config entry > env var > built-in default**. A
 config entry named `openrouter`/`openai`/`ollama` inherits that built-in's wire

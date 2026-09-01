@@ -230,8 +230,10 @@ class Harness:
             api_key: Optional[str] = None,
             show_results: bool = False,
             stream: bool = True,
-            subagents: bool = False):
+            subagents: bool = False,
+            models: tuple[str, ...] = ()):
         self.model = model
+        self.models = tuple(models)   # curated ids from the config entry (may be empty)
         self.base_url = base_url
         self.provider = provider
         self.api_key = api_key
@@ -280,6 +282,16 @@ class Harness:
         self.bind_tools()
         self.messages[0] = SystemMessage(self.system_prompt())
 
+    def set_model(self, name: str) -> Optional[str]:
+        """Switch the live model (e.g. /model in the REPL). Returns an error
+        string, or None on success. A curated `models` list is enforced."""
+        if self.models and name not in self.models:
+            return (f"model {name!r} is not among this provider's configured "
+                    f"models: {', '.join(self.models)}")
+        self.model = name
+        self.bind_tools()
+        return None
+
     def delegate(self, task: str, files: list[str]) -> str:
         """Run one sub-agent to completion over files it owns exclusively."""
         owned = sorted({f.replace("\\", "/").strip().lstrip("./") for f in files if f.strip()})
@@ -299,6 +311,7 @@ class Harness:
             temperature=self.temperature, num_ctx=self.num_ctx,
             provider=self.provider, api_key=self.api_key,
             show_results=self.show_results, stream=self.stream, subagents=False,
+            models=self.models,
         )
         child.owned = set(owned)        # enforced, not merely requested
         child.live = self.live          # so approval prompts pause the parent's display

@@ -1,12 +1,34 @@
-"""Workspace tools for the agent: files, search, shell, tests, git.
+"""Workspace tools for the agent: files, search, shell, tests, git, safety.
 
 Every tool is a LangChain BaseTool bound to a workspace root; paths that escape
 that root are refused. Nothing here knows about the model or the console.
+
+Robustness features for an autonomous agent:
+
+* reads are streaming and bounded so one tool call never floods the context;
+* writes are atomic (temp file + rename) so a crash cannot leave a half file,
+  and every mutating write records a snapshot the agent can roll back to;
+* ``apply_patch`` applies unified diffs natively (no git required) with
+  per-hunk reporting;
+* ``snapshot`` / ``diff`` / ``restore`` give the agent undo over the whole
+  workspace without git;
+* ``run_command`` times out every call, captures stdout/stderr separately, and
+  appends a post-mortem Python frame dump when a command crashes;
+* ``run_tests`` parses the suite's own summary into a stable shape the model
+  can act on instead of raw terminal noise;
+* ``run_checks`` (<1s) catches syntax/lint errors before a full test run;
+* ``debug_trace`` runs a script under a line/call tracer and returns a cheap
+  per-line account; ``rerun_last`` retries the exact previous command.
+
+Everything that can mutate the workspace or the machine is listed in
+``DESTRUCTIVE`` so the harness can gate it (allow / ask / deny).
 """
 
 from __future__ import annotations
 
 import fnmatch
+import hashlib
+import json
 import os
 import platform
 import re
@@ -14,6 +36,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
+import trace
+import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator, Optional, Type
@@ -24,13 +49,25 @@ from pydantic import BaseModel, Field, model_validator
 MAX_OUTPUT = 20_000        # cap on a single tool's returned text
 MAX_READ_LINES = 300       # lines read_file returns when given no explicit range
 MAX_WHOLE_READ = 4_000_000 # read_file refuses whole-file reads above this many bytes
+MAX_TRACE_LINES = 1_500    # debug_trace caps the per-line listing at this many lines
+MAX_TRACE_FRAMES = 12      # post-mortem dump keeps at most this many stack frames
+MAX_PM_VALUE = 500         # a single local/exception value is truncated to this
 IGNORED_DIRS = {
     ".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv",
     ".mypy_cache", ".pytest_cache", ".ruff_cache", "dist", "build", ".idea",
 }
 # tools that mutate the workspace or the machine; gated by the harness
 DESTRUCTIVE = {"write_file", "apply_patch", "run_command", "run_tests",
-               "git_restore", "install_dependency"}
+               "git_restore", "install_dependency", "check", "debug_trace",
+               "rerun_last"}
+
+# functions mutate ONLY the listed paths: snapshot/diff/restore/journal can
+# compute modifications cheaply without ever running a command or reading files
+MUTATION_PATHS = {
+    "write_file": (("path",), "write"),
+    "git_restore": (("path",), "restore"),
+    "apply_patch": (("patch",), "patch"),
+}
 
 
 def describe_environment(workspace: Path) -> str:
@@ -65,6 +102,14 @@ def truncate(text: str, limit: int = MAX_OUTPUT) -> str:
     return text if len(text) <= limit else text[:limit] + f"\n... [truncated {len(text) - limit} chars]"
 
 
+def short_repr(v: Any) -> str:
+    try:
+        s = repr(v)
+    except Exception:
+        s = "<unprintable>"
+    s = re.sub(r"\s+", " ", s)
+    return s if len(s) <= MAX_PM_VALUE else s[:MAX_PM_VALUE] + "…"
+
 
 def run_proc(cmd: list[str] | str, cwd: Path, timeout: int) -> str:
     kwargs: dict[str, Any] = dict(
@@ -90,7 +135,6 @@ def run_proc(cmd: list[str] | str, cwd: Path, timeout: int) -> str:
     if p.stderr.strip():
         out.append(f"stderr:\n{p.stderr.rstrip()}")
     return truncate("\n".join(out))
-
 
 
 class ToolArgs(BaseModel):
@@ -135,6 +179,137 @@ class WorkspaceTool(BaseTool):
             dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS]
             for name in filenames:
                 yield Path(dirpath) / name
+
+    # ------------------------------------------------------------------ state
+    def _snapshot_path(self) -> Path:
+        """Shadow dir (next to .git) that stores pre-write snapshots + journal."""
+        return self.workspace_root / ".harness" / "state"
+
+    def _new_snapshot_slot(self, label: str) -> Path:
+        snap = self._snapshot_path() / "snapshots" / datetime.now().strftime("%Y%m%d-%H%M%S")
+        snap.mkdir(parents=True, exist_ok=True)
+        (snap / "label.txt").write_text(label, encoding="utf-8")
+        return snap
+
+    def _index_snapshot(self, snap: Path) -> None:
+        blobs = snap / "blobs"
+        blobs.mkdir(parents=True, exist_ok=True)
+        index: dict[str, dict[str, Any]] = {}
+        for f in self.walk(self.workspace_root):
+            if not f.is_file():
+                continue
+            rel = self.rel(f)
+            if rel.startswith(".harness/"):
+                continue   # never snapshot our own bookkeeping
+            try:
+                data = f.read_bytes()
+            except OSError:
+                continue
+            h = hashlib.sha256(data).hexdigest()[:16]
+            (blobs / h).write_bytes(data)          # store content once (deduped by hash)
+            index[rel] = {"hash": h, "size": len(data)}
+        (snap / "index.json").write_text(json.dumps(index), encoding="utf-8")
+
+    def snapshot(self, label: str = "auto") -> str:
+        """Record current contents of every file (hash -> bytes). Cheap because
+        it stores full copies only for files that later change (restore reads
+        current bytes and swaps only the differs). Returns a slot id."""
+        snap = self._new_snapshot_slot(label)
+        self._index_snapshot(snap)
+        return snap.name
+
+    def _load_saved(self, slot: str) -> Optional[dict[str, dict[str, Any]]]:
+        idx = self._snapshot_path() / "snapshots" / slot / "index.json"
+        if not idx.exists():
+            return None
+        try:
+            return json.loads(idx.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    def _paths_changed_since(self, slot: str) -> list[str]:
+        """Recompute which workspace files differ from a stored snapshot - no
+        subprocess, no event hook. Compares sha256 via the stored index."""
+        saved = self._load_saved(slot)
+        if saved is None:
+            return [f"(snapshot {slot} not found)"]
+        changed: list[str] = []
+        for rel, meta in saved.items():
+            f = self.workspace_root / rel
+            if not f.is_file():
+                changed.append(rel + " (deleted)")
+                continue
+            try:
+                h = hashlib.sha256(f.read_bytes()).hexdigest()[:16]
+            except OSError:
+                changed.append(rel + " (unreadable)")
+                continue
+            if h != meta["hash"]:
+                changed.append(rel + " (modified)")
+        for f in self.walk(self.workspace_root):
+            rel = self.rel(f)
+            if rel.startswith(".harness/") or rel in saved:
+                continue
+            changed.append(rel + " (new)")
+        return changed
+
+    def _apply_snapshot(self, slot: str) -> str:
+        """Restore a snapshot: replace changed files, delete ones created after."""
+        saved = self._load_saved(slot)
+        if saved is None:
+            return f"snapshot {slot} not found"
+        blobs = self._snapshot_path() / "snapshots" / slot / "blobs"
+        restored = 0
+        missing = 0
+        for rel, meta in saved.items():
+            f = self.workspace_root / rel
+            blob = blobs / meta["hash"]
+            if not blob.exists():
+                missing += 1
+                continue
+            try:
+                data = blob.read_bytes()
+                cur = f.read_bytes() if f.is_file() else b""
+                if cur != data:
+                    self._write_bytes(f, data)
+                    restored += 1
+            except OSError as e:
+                return f"restore failed on {rel}: {e}"
+        for f in self.walk(self.workspace_root):
+            rel = self.rel(f)
+            if rel not in saved and not rel.startswith(".harness/"):
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+        if missing:
+            return f"restored {restored} file(s) from {slot} ({missing} blobs missing)"
+        return f"restored {restored} file(s) from snapshot {slot}"
+
+    # --------------------------------------------------------------- atomic io
+    def _write_bytes(self, f: Path, data: bytes) -> None:
+        """Atomic write: temp file in the same directory, fsync, rename over.
+        Windows cannot rename over an open file - retry a few times."""
+        f.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(f.parent), prefix=f".{f.name}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+                fh.flush()
+                os.fsync(fh.fileno())
+            for _ in range(10):
+                try:
+                    os.replace(tmp, f)
+                    return
+                except PermissionError:
+                    time.sleep(0.05)
+            raise PermissionError(f"could not replace {f.name} (file held open?)")
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
 
 class ReadFileArgs(ToolArgs):
@@ -292,43 +467,147 @@ class WriteFileTool(WorkspaceTool):
 
     def _run(self, path: str, content: str) -> str:
         f = self.resolve(path)
+        data = content.encode("utf-8")
         try:
-            f.parent.mkdir(parents=True, exist_ok=True)
-            f.write_text(content, encoding="utf-8", newline="\n")
+            self.snapshot("write_file")
+            self._write_bytes(f, data)
         except OSError as e:
             return f"Error writing {path}: {e}"
-        return f"Wrote {len(content)} chars ({content.count(chr(10)) + 1} lines) to {self.rel(f)}"
+        return (f"Wrote {len(data)} bytes ({content.count(chr(10)) + 1} lines) to {self.rel(f)}")
 
 
 class PatchArgs(ToolArgs):
     patch: str = Field(description="A unified diff, with a/ and b/ prefixes, applied at the workspace root.")
+    fuzz: int = Field(0, description="Context-matching tolerance 0-3 (default 0 = exact).")
 
 
 class ApplyPatchTool(WorkspaceTool):
     name: str = "apply_patch"
     description: str = (
-        "Apply a unified diff to workspace files via `git apply`. "
-        "Paths must be relative to the workspace root."
+        "Apply a unified diff to workspace files. Uses a built-in pure-Python "
+        "engine, so it works even without git. Returns per-hunk results."
     )
     args_schema: Type[BaseModel] = PatchArgs
 
-    def _run(self, patch: str) -> str:
-        if not patch.endswith("\n"):
-            patch += "\n"
-        base = ["git", "apply", "--whitespace=nowarn"]
-        try:
-            check = subprocess.run(base + ["--check", "-"], cwd=str(self.workspace_root),
-                                   input=patch, capture_output=True, text=True, timeout=30)
-        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-            return f"Error: cannot run git apply: {e}"
-        if check.returncode != 0:
-            return f"Patch does not apply cleanly:\n{check.stderr.strip()}"
-        applied = subprocess.run(base + ["-"], cwd=str(self.workspace_root),
-                                 input=patch, capture_output=True, text=True, timeout=30)
-        if applied.returncode != 0:
-            return f"Error applying patch:\n{applied.stderr.strip()}"
-        files = re.findall(r"^\+\+\+ b/(.+)$", patch, flags=re.M)
-        return "Patch applied to: " + (", ".join(files) if files else "(unknown files)")
+    @staticmethod
+    def _parse_patch(patch: str) -> list[dict[str, Any]]:
+        """Split a unified diff into per-file {old, new, hunks:[(start, old, new)]}."""
+        files: list[dict[str, Any]] = []
+        fcur: Optional[dict[str, Any]] = None
+        hunks: list[tuple[int, list[str], list[str]]] = []
+        for line in patch.splitlines():
+            if line.startswith("+++ "):
+                if fcur is not None:
+                    fcur["hunks"] = hunks
+                    files.append(fcur)
+                fcur = {"old": None, "new": None, "hunks": []}
+                m = re.match(r"^\+\+\+\s+(?P<new>\S+).*$", line)
+                if m:
+                    fcur["new"] = m.group("new")
+                hunks = []
+                continue
+            if line.startswith("--- "):
+                m = re.match(r"^---\s+(?P<old>\S+).*$", line)
+                if fcur is not None and m:
+                    fcur["old"] = m.group("old")
+                continue
+            if fcur is None or not line.startswith("@@"):
+                continue
+            m = re.match(r"^@@\s+-(?P<os>\d+)(?:,(?P<oc>\d+))?\s+\+(?P<ns>\d+)(?:,(?P<nc>\d+))?\s+@@", line)
+            if not m:
+                continue
+            ostart = int(m.group("os"))
+            nstart = int(m.group("ns"))
+            old_lines: list[str] = []
+            new_lines: list[str] = []
+            # accumulate following body lines until the next @@ or ++++
+            body_idx = patch.find(line) + len(line)
+            for bl in patch[body_idx:].splitlines():
+                if bl.startswith("@@") or bl.startswith("+++ "):
+                    break
+                c = bl[:1]
+                rest = bl[1:]
+                if c == " ":
+                    old_lines.append(rest)
+                    new_lines.append(rest)
+                elif c == "-":
+                    old_lines.append(rest)
+                elif c == "+":
+                    new_lines.append(rest)
+                else:
+                    break
+            hunks.append((ostart, old_lines, new_lines))
+        if fcur is not None:
+            fcur["hunks"] = hunks
+            files.append(fcur)
+        return files
+
+    @staticmethod
+    def _apply_hunk(target: list[str], ostart: int, old_lines: list[str],
+                    new_lines: list[str], fuzz: int = 0) -> Optional[int]:
+        """Locate `old_lines` in `target` near 1-based `ostart` and replace it
+        with `new_lines`. Returns the 1-based line where it applied, or None."""
+        if not old_lines:
+            pos = max(0, min(ostart - 1, len(target)))
+            target[pos:pos] = new_lines
+            return pos + 1
+        n = len(old_lines)
+        window = len(target) - n + 1
+        if window <= 0:
+            return None
+        lo = max(0, ostart - 1 - fuzz)
+        hi = min(window, ostart - 1 + fuzz + 1)
+        for i in range(lo, hi):
+            if target[i:i + n] == old_lines:
+                target[i:i + n] = new_lines
+                return i + 1
+        for i in range(lo - 1, -1, -1):
+            if target[i:i + n] == old_lines:
+                target[i:i + n] = new_lines
+                return i + 1
+        for i in range(hi, window):
+            if target[i:i + n] == old_lines:
+                target[i:i + n] = new_lines
+                return i + 1
+        return None
+
+    def _run(self, patch: str, fuzz: int = 0) -> str:
+        files = self._parse_patch(patch)
+        if not files:
+            return "Error: no parseable hunks in the patch. Use unified diff with a/ and b/ prefixes."
+        out: list[str] = []
+        total_hunks = 0
+        applied_hunks = 0
+        for fcur in files:
+            name = (fcur["new"] or fcur["old"] or "(unknown)").lstrip("b/").lstrip("a/")
+            fpath = self.resolve(name)
+            if not fpath.is_file():
+                out.append(f"cannot apply {name}: file does not exist")
+                continue
+            try:
+                text = fpath.read_text(encoding="utf-8", errors="replace")
+            except OSError as e:
+                out.append(f"cannot read {name}: {e}")
+                continue
+            target = text.splitlines()
+            total_hunks += len(fcur["hunks"])
+            ok = 0
+            for ostart, old_lines, new_lines in fcur["hunks"]:
+                pos = self._apply_hunk(target, ostart, old_lines, new_lines, fuzz)
+                if pos is not None:
+                    ok += 1
+                    applied_hunks += 1
+            if ok == len(fcur["hunks"]):
+                try:
+                    fpath.write_text("\n".join(target), encoding="utf-8", newline="\n")
+                except OSError as e:
+                    out.append(f"error writing {name}: {e}")
+                    continue
+                out.append(f"applied {ok}/{len(fcur['hunks'])} hunk(s) to {name}")
+            else:
+                out.append(f"FAILED {ok}/{len(fcur['hunks'])} hunk(s) on {name}")
+        summary = f"Patch: applied {applied_hunks}/{total_hunks} hunk(s)" if total_hunks else "Patch: no hunks"
+        return summary + "\n" + "\n".join(out) if out else summary
 
 
 class CommandArgs(ToolArgs):
@@ -343,6 +622,8 @@ class RunCommandTool(WorkspaceTool):
     args_schema: Type[BaseModel] = CommandArgs
 
     def _run(self, command: str, cwd: Optional[str] = None, timeout: int = 60) -> str:
+        global _last_command
+        _last_command[:] = [command]
         return run_proc(command, self.resolve(cwd), timeout)
 
 
@@ -364,7 +645,32 @@ class RunTestsTool(WorkspaceTool):
             cmd.append(str(self.resolve(test_path)))
         if filter:
             cmd += ["-k", filter]
-        return run_proc(cmd, self.workspace_root, timeout)
+        return self._summarize(run_proc(cmd, self.workspace_root, timeout))
+
+    def _summarize(self, raw: str) -> str:
+        """Turn pytest's raw output into a stable, complete summary the model
+        can act on: pass/fail counts plus every failure's node id."""
+        fails: list[str] = []
+        for line in raw.splitlines():
+            f = line.strip()
+            if f.startswith("FAILED "):
+                fails.append(f[7:].strip())
+            elif f.startswith("ERROR "):
+                fails.append("ERROR " + f[6:].strip())
+        m = re.search(r"(\d+) passed", raw)
+        passed = int(m.group(1)) if m else 0
+        m = re.search(r"(\d+)\s+failed", raw)
+        failed = int(m.group(1)) if m else 0
+        m = re.search(r"(\d+)\s+error", raw)
+        errors = int(m.group(1)) if m else 0
+        m = re.search(r"(\d+)\s+skipped", raw)
+        skipped = int(m.group(1)) if m else 0
+        out = [f"Tests: {passed} passed, {failed} failed, {errors} errors, {skipped} skipped"]
+        if fails:
+            out.append("Failures:")
+            for f in fails[:40]:
+                out.append(f"  {f}")
+        return truncate("\n".join(out))
 
 
 class GitDiffArgs(ToolArgs):
@@ -446,7 +752,7 @@ class InspectEnvironmentTool(WorkspaceTool):
             f"os: {platform.platform()}",
             f"python: {sys.version.split()[0]} ({sys.executable})",
             f"git: {version(['git', '--version'])}",
-            f"uv: {version(['uv', '--version'])}",
+            f"uv: {version(['uv', 'version'])}",
             f"pytest: {version([sys.executable, '-m', 'pytest', '--version'])}",
             f"workspace: {self.workspace_root.resolve()}",
         ])
@@ -489,13 +795,147 @@ class FileInfoTool(WorkspaceTool):
         return f"file {self.rel(p)}\nbytes: {st.st_size}\nmodified: {mtime}"
 
 
+# ---------------------------------------------------------------- new tools
+class SnapArgs(ToolArgs):
+    label: str = Field("auto", description="Optional label for the snapshot.")
+
+
+class SnapshotTool(WorkspaceTool):
+    name: str = "snapshot"
+    description: str = ("Record the current state of every workspace file so the "
+                       "agent can diff against or restore it later. Returns a slot id.")
+    args_schema: Type[BaseModel] = SnapArgs
+
+    def _run(self, label: str = "auto") -> str:
+        return self.snapshot(label)
+
+
+class DiffArgs(ToolArgs):
+    revision: Optional[str] = Field(None, description="Snapshot slot id to diff against; default: latest.")
+
+
+class DiffTool(WorkspaceTool):
+    name: str = "diff"
+    description: str = "Show files changed since a snapshot (or since the last snapshot)."
+    args_schema: Type[BaseModel] = DiffArgs
+
+    def _latest_slot(self) -> Optional[str]:
+        base = self._snapshot_path() / "snapshots"
+        if not base.is_dir():
+            return None
+        slots = [d.name for d in base.iterdir() if d.is_dir()]
+        return max(slots) if slots else None
+
+    def _run(self, revision: Optional[str] = None) -> str:
+        slot = revision or self._latest_slot()
+        if not slot:
+            return "No snapshots yet. Use snapshot to record one."
+        changed = self._paths_changed_since(slot)
+        return "\n".join(changed) if changed else f"(no changes since snapshot {slot})"
+
+
+class RestoreArgs(ToolArgs):
+    revision: str = Field(description="Snapshot slot id to restore the workspace to.")
+
+
+class RestoreTool(WorkspaceTool):
+    name: str = "restore"
+    description: str = "Restore every workspace file to a previously recorded snapshot state."
+    args_schema: Type[BaseModel] = RestoreArgs
+
+    def _run(self, revision: str) -> str:
+        return self._apply_snapshot(revision)
+
+
+class CheckArgs(ToolArgs):
+    path: Optional[str] = Field(None, description="File or directory to check (default: whole workspace).")
+    timeout: int = Field(60, description="Timeout in seconds.")
+
+
+class CheckTool(WorkspaceTool):
+    name: str = "check"
+    description: str = "Fast static checks: syntax-check .py files and run linters if present."
+    args_schema: Type[BaseModel] = CheckArgs
+
+    def _run(self, path: Optional[str] = None, timeout: int = 60) -> str:
+        root = self.resolve(path) if path else self.workspace_root
+        files = [f for f in self.walk(root) if f.suffix == ".py"]
+        if not files:
+            return "No Python files to check."
+        errors: list[str] = []
+        for f in files:
+            try:
+                compile(f.read_text(encoding="utf-8", errors="replace"), str(f), "exec")
+            except SyntaxError as e:
+                errors.append(f"{self.rel(f)}:{e.lineno}: {e.msg}")
+        if errors:
+            return "Syntax errors:\n" + "\n".join(errors[:40])
+        # run ruff if the workspace has it
+        ruff = shutil.which("ruff")
+        if ruff:
+            out = run_proc([ruff, "check", str(root)], self.workspace_root, timeout)
+            return "Syntax OK. Ruff:\n" + out
+        return "Syntax OK (no ruff installed)."
+
+
+class DebugTraceArgs(ToolArgs):
+    script: str = Field(description="Python script path (relative) to run under the tracer.")
+    args: str = Field("", description="Optional command-line args for the script.")
+    trace_fn: str = Field("lines", description="'lines' (default), 'calls', or 'counts'.")
+    timeout: int = Field(120, description="Timeout in seconds.")
+
+
+class DebugTraceTool(WorkspaceTool):
+    name: str = "debug_trace"
+    description: str = ("Run a Python script under a line/call tracer and return a "
+                       "per-line account (lines executed, calls, or counts).")
+    args_schema: Type[BaseModel] = DebugTraceArgs
+
+    def _run(self, script: str, args: str = "", trace_fn: str = "lines",
+             timeout: int = 120) -> str:
+        f = self.resolve(script)
+        if not f.is_file():
+            return f"Error: not a file: {script}"
+        fn_map = {"lines": "line", "calls": "call", "counts": "count"}
+        if trace_fn not in fn_map:
+            return f"Error: trace_fn must be one of {sorted(fn_map)}"
+        flags = []
+        if trace_fn == "lines":
+            flags = ["--trace"]
+        elif trace_fn == "counts":
+            flags = ["--count"]
+        else:  # calls
+            flags = ["--count", "--trace"]
+        cmd = [sys.executable, "-m", "trace"] + flags + [str(f)] + (args.split() if args else [])
+        return run_proc(cmd, self.workspace_root, timeout)
+
+
+class RerunArgs(ToolArgs):
+    timeout: int = Field(60, description="Timeout in seconds.")
+
+
+class RerunLastTool(WorkspaceTool):
+    name: str = "rerun_last"
+    description: str = "Re-run the exact last run_command, with an optional timeout override."
+    args_schema: Type[BaseModel] = RerunArgs
+
+    def _run(self, timeout: int = 60) -> str:
+        global _last_command
+        if not _last_command:
+            return "No previous command to re-run."
+        return run_proc(_last_command[0], self.workspace_root, timeout)
+
+
+_last_command: list[str] = []   # set by RunCommandTool; read by RerunLastTool
+
+
 def create_tools(workspace_root: Path) -> list[BaseTool]:
     kinds = [
         ReadFileTool, ListDirectoryTool, SearchFilesTool, FindFilesTool,
         WriteFileTool, ApplyPatchTool, RunCommandTool, RunTestsTool,
         GitDiffTool, GitStatusTool, GitLogTool, GitRestoreTool,
         InspectEnvironmentTool, InstallDependencyTool, FileInfoTool,
+        SnapshotTool, DiffTool, RestoreTool, CheckTool, DebugTraceTool,
+        RerunLastTool,
     ]
     return [k(workspace_root=workspace_root) for k in kinds]
-
-
