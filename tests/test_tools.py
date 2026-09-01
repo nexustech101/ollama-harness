@@ -1,10 +1,10 @@
-"""Workspace tool tests: path sandboxing, singleton args, read ranges."""
+"""Workspace tool tests: path sandboxing, singleton args, read ranges, patches."""
 
 from __future__ import annotations
 
 import pytest
 
-from tools import ReadFileTool, WriteFileTool
+from tools import ApplyPatchTool, ReadFileTool, WriteFileTool
 
 
 def test_write_refuses_escape(tmp_path):
@@ -54,3 +54,53 @@ def test_read_file_out_of_range_reports_clearly(tmp_path):
     f.write_text("one\ntwo\n")
     tool = ReadFileTool(workspace_root=tmp_path)
     assert "no lines in range" in tool.invoke({"path": "small.txt", "start_line": 5})
+
+
+def test_apply_patch_replaces_lines(tmp_path):
+    f = tmp_path / "a.txt"
+    f.write_text("line1\nline2\n", encoding="utf-8")
+    tool = ApplyPatchTool(workspace_root=tmp_path)
+    patch = "--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,2 @@\n-line1\n-line2\n+LINE1\n+LINE2\n"
+    out = tool.invoke({"patch": patch, "fuzz": 0})
+    assert "applied 1/1 hunk(s)" in out
+    assert f.read_text(encoding="utf-8") == "LINE1\nLINE2"
+
+
+def test_apply_patch_multiple_hunks(tmp_path):
+    f = tmp_path / "a.txt"
+    f.write_text("one\ntwo\nthree\n", encoding="utf-8")
+    tool = ApplyPatchTool(workspace_root=tmp_path)
+    patch = (
+        "--- a/a.txt\n+++ b/a.txt\n"
+        "@@ -1,3 +1,3 @@\n one\n-two\n+2\n three\n"
+        "@@ -3,1 +3,1 @@\n-three\n+3\n"
+    )
+    out = tool.invoke({"patch": patch, "fuzz": 0})
+    assert "applied 2/2 hunk(s)" in out
+    assert f.read_text(encoding="utf-8") == "one\n2\n3"
+
+
+def test_apply_patch_failed_hunk_reports_partial(tmp_path):
+    f = tmp_path / "a.txt"
+    f.write_text("one\n", encoding="utf-8")
+    tool = ApplyPatchTool(workspace_root=tmp_path)
+    patch = "--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,2 @@\n-one\n-missing\n+1\n+2\n"
+    out = tool.invoke({"patch": patch, "fuzz": 0})
+    assert "FAILED" in out and "0/1" in out
+    assert f.read_text(encoding="utf-8") == "one\n"
+
+
+def test_apply_patch_multiple_files(tmp_path):
+    (tmp_path / "a.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "b.txt").write_text("hello\n", encoding="utf-8")
+    tool = ApplyPatchTool(workspace_root=tmp_path)
+    patch = (
+        "--- a/a.py\n+++ b/a.py\n"
+        "@@ -1,3 +1,3 @@\n def f():\n-    return 1\n+    return 2\n"
+        "--- a/b.txt\n+++ b/b.txt\n"
+        "@@ -1 +1 @@\n-hello\n+goodbye\n"
+    )
+    out = tool.invoke({"patch": patch, "fuzz": 0})
+    assert "applied 2/2 hunk(s)" in out
+    assert (tmp_path / "a.py").read_text(encoding="utf-8") == "def f():\n    return 2"
+    assert (tmp_path / "b.txt").read_text(encoding="utf-8") == "goodbye"
