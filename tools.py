@@ -23,6 +23,7 @@ from pydantic import BaseModel, Field, model_validator
 
 MAX_OUTPUT = 20_000        # cap on a single tool's returned text
 MAX_READ_LINES = 300       # lines read_file returns when given no explicit range
+MAX_WHOLE_READ = 4_000_000 # read_file refuses whole-file reads above this many bytes
 IGNORED_DIRS = {
     ".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv",
     ".mypy_cache", ".pytest_cache", ".ruff_cache", "dist", "build", ".idea",
@@ -66,16 +67,19 @@ def truncate(text: str, limit: int = MAX_OUTPUT) -> str:
 
 
 def run_proc(cmd: list[str] | str, cwd: Path, timeout: int) -> str:
+    kwargs: dict[str, Any] = dict(
+        shell=isinstance(cmd, str),
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",      # stable decoding regardless of console code page
+        errors="replace",
+        timeout=timeout,
+    )
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
-        p = subprocess.run(
-            cmd,
-            shell=isinstance(cmd, str),
-            cwd=str(cwd),
-            capture_output=True,
-            text=True,
-            errors="replace",
-            timeout=timeout,
-        )
+        p = subprocess.run(cmd, **kwargs)
     except subprocess.TimeoutExpired:
         return f"Error: timed out after {timeout}s"
     except FileNotFoundError as e:
@@ -144,25 +148,52 @@ class ReadFileTool(WorkspaceTool):
     description: str = "Read a text file from the workspace. Returns numbered lines."
     args_schema: Type[BaseModel] = ReadFileArgs
 
-    def _run(self, path: str, start_line: Optional[int] = None, end_line: Optional[int] = None) -> str:
+    def _run(self, path: str, start_line: Optional[int] = None,
+             end_line: Optional[int] = None) -> str:
         f = self.resolve(path)
         if not f.is_file():
             return f"Error: not a file: {path}"
         try:
-            lines = f.read_text(encoding="utf-8", errors="replace").splitlines()
+            size = f.stat().st_size
+            with f.open("r", encoding="utf-8", errors="replace") as fh:
+                if start_line is None and end_line is None:
+                    # whole-file read, but never blow up the context on a giant file
+                    if size > MAX_WHOLE_READ:
+                        return (f"{self.rel(f)}: {size:,} bytes — too large to read "
+                                "whole. Pass start_line/end_line for a range.")
+                    lines = fh.readlines()
+                    total = len(lines)
+                    end = min(total, MAX_READ_LINES)
+                    note = ""
+                    if total > MAX_READ_LINES:
+                        end = MAX_READ_LINES
+                        note = (f"\n[showing first {MAX_READ_LINES} of {total} lines; "
+                                "re-read with start_line/end_line for the rest]")
+                    body = "\n".join(
+                        f"{i:>5}  {lines[i - 1].rstrip()}" for i in range(1, end + 1))
+                    return truncate(f"{self.rel(f)} (lines 1-{end} of {total})\n{body}{note}")
+
+                # explicit range: stream only the requested lines
+                first = max(1, start_line or 1)
+                rows: list[str] = []
+                for i, line in enumerate(fh, start=1):
+                    if i < first:
+                        continue
+                    if end_line is not None and i > end_line:
+                        break
+                    rows.append(f"{i:>5}  {line.rstrip()}")
+                    if end_line is None and len(rows) >= MAX_READ_LINES:
+                        rows.append("... [re-read with end_line for the rest]")
+                        break
+                if not rows:
+                    where = f"{first}" + (f"-{end_line}" if end_line else "+")
+                    return f"{path}: no lines in range {where}"
+                shown = f"{first}-{first + len(rows) - 1}"
+                if rows and rows[-1].startswith("... ["):
+                    shown = f"{first}-{first + len(rows) - 2}+"
+                return truncate(f"{self.rel(f)} (lines {shown})\n" + "\n".join(rows))
         except OSError as e:
             return f"Error reading {path}: {e}"
-        start = max(1, start_line or 1)
-        end = min(len(lines), end_line or len(lines))
-        if start > len(lines):
-            return f"{path}: only {len(lines)} lines"
-        note = ""
-        if start_line is None and end_line is None and len(lines) > MAX_READ_LINES:
-            end = MAX_READ_LINES
-            note = (f"\n[showing first {MAX_READ_LINES} of {len(lines)} lines; "
-                    "re-read with start_line/end_line for the rest]")
-        body = "\n".join(f"{i:>5}  {lines[i - 1]}" for i in range(start, end + 1))
-        return truncate(f"{self.rel(f)} (lines {start}-{end} of {len(lines)})\n{body}{note}")
 
 
 class ListDirArgs(ToolArgs):

@@ -21,7 +21,7 @@ from fastapi.responses import StreamingResponse
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from pydantic import BaseModel
 
-from harness import Harness, fmt_args
+from harness import DEFAULT_NUM_CTX, Harness, fmt_args
 
 
 @dataclass
@@ -32,11 +32,12 @@ class ServerConfig:
     base_url: str
     workspace: Path
     mode: str = "deny"          # deny (read-only) / ask (unusable headless) / allow
-    num_ctx: int = 32_768
+    num_ctx: int = DEFAULT_NUM_CTX
     max_steps: int = 0          # 0 = no limit; retry_limit ends stuck runs
     retry_limit: int = 5
-    subagents: bool = False
+    provider: str = "ollama"
     api_key: Optional[str] = None
+    subagents: bool = False
     cors_origins: list[str] = field(default_factory=lambda: ["*"])
 
 
@@ -119,6 +120,8 @@ def create_app(config: ServerConfig) -> FastAPI:
             base_url=config.base_url,
             max_steps=request.max_steps if request.max_steps is not None else config.max_steps,
             retry_limit=config.retry_limit,
+            provider=config.provider,
+            api_key=config.api_key,
             subagents=config.subagents,
             mode=config.mode,
             temperature=request.temperature,
@@ -141,6 +144,7 @@ def create_app(config: ServerConfig) -> FastAPI:
     def health() -> dict[str, Any]:
         return {
             "status": "ok",
+            "provider": config.provider,
             "model": config.model,
             "workspace": str(config.workspace),
             "mode": config.mode,

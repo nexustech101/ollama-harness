@@ -29,6 +29,7 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.text import Text
 
+from providers import Provider
 from tools import DESTRUCTIVE, ToolArgs, create_tools, describe_environment, truncate
 
 console = Console()
@@ -41,6 +42,7 @@ THINK_TAGS = re.compile(r"</?think>")
 REPEAT_LIMIT = 3      # identical failing tool calls tolerated before abandoning
 RETRY_LIMIT = 5       # consecutive tool failures tolerated before abandoning
 STEP_CEILING = 1_000  # backstop against a loop that never terminates
+DEFAULT_NUM_CTX = 200_000  # single source of truth for the default context window
 
 
 class StreamView:
@@ -216,20 +218,24 @@ class SpawnAgentTool(BaseTool):
 class Harness:
     def __init__(
             self,
-            model: str, 
-            workspace: Path, 
+            model: str,
+            workspace: Path,
             base_url: str,
             *,
             max_steps: int = 0,          # 0 = no limit
             retry_limit: int = RETRY_LIMIT,
             mode: str = "ask",
-            temperature: float = 0.0, 
-            num_ctx: int = 8192,
+            temperature: float = 0.0,
+            num_ctx: int = DEFAULT_NUM_CTX,
+            provider: str = "ollama",
+            api_key: Optional[str] = None,
             show_results: bool = False,
             stream: bool = True,
             subagents: bool = False):
         self.model = model
         self.base_url = base_url
+        self.provider = provider
+        self.api_key = api_key
         self.temperature = temperature
         self.subagents = subagents
         self.claimed: dict[str, int] = {}   # file -> sub-agent that owns it
@@ -258,17 +264,17 @@ class Harness:
         return prompt + SUBAGENT_RULES if self.subagents else prompt
 
     def bind_tools(self) -> None:
-        """(Re)build the tool set. spawn_agent appears only when sub-agents are on."""
-        from langchain_ollama import ChatOllama  # here for a clearer import error
-
+        """(Re)build the tool set and the model. spawn_agent appears only when
+        sub-agents are on. The model itself comes from the provider layer."""
         self.tools = create_tools(self.workspace)
         if self.subagents:
             self.tools.append(SpawnAgentTool(parent=self))
         self.tool_map = {t.name: t for t in self.tools}
-        self.llm = ChatOllama(
-            model=self.model, base_url=self.base_url,
-            temperature=self.temperature, num_ctx=self.num_ctx,
-        ).bind_tools(self.tools)
+        self.llm = Provider(
+            name=self.provider, model=self.model, base_url=self.base_url,
+            api_key=self.api_key, num_ctx=self.num_ctx,
+            temperature=self.temperature,
+        ).build().bind_tools(self.tools)
 
     def set_subagents(self, enabled: bool) -> None:
         self.subagents = enabled
@@ -292,6 +298,7 @@ class Harness:
             model=self.model, workspace=self.workspace, base_url=self.base_url,
             max_steps=self.max_steps, retry_limit=self.retry_limit, mode=self.mode,
             temperature=self.temperature, num_ctx=self.num_ctx,
+            provider=self.provider, api_key=self.api_key,
             show_results=self.show_results, stream=self.stream, subagents=False,
         )
         child.owned = set(owned)        # enforced, not merely requested
@@ -455,7 +462,12 @@ class Harness:
                 yield {"type": "error", "text": "interrupted"}
                 return
             except Exception as e:
-                yield {"type": "error", "text": f"LLM call failed: {type(e).__name__}: {e}"}
+                text = f"LLM call failed: {type(e).__name__}: {e}"
+                if self.provider != "ollama" and (
+                        "401" in text or "authentication" in text.lower()):
+                    text += (" — set HARNESS_API_KEY (or the provider's key env "
+                             "var) and check --base-url.")
+                yield {"type": "error", "text": text}
                 return
 
             self.messages.append(reply)
