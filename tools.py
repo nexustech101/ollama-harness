@@ -37,8 +37,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import trace
-import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator, Optional, Type
@@ -473,7 +471,7 @@ class WriteFileTool(WorkspaceTool):
             self._write_bytes(f, data)
         except OSError as e:
             return f"Error writing {path}: {e}"
-        return (f"Wrote {len(data)} bytes ({content.count(chr(10)) + 1} lines) to {self.rel(f)}")
+        return f"Wrote {len(data)} bytes ({content.count(chr(10)) + 1} lines) to {self.rel(f)}"
 
 
 class PatchArgs(ToolArgs):
@@ -495,7 +493,7 @@ class ApplyPatchTool(WorkspaceTool):
         files: list[dict[str, Any]] = []
         fcur: Optional[dict[str, Any]] = None
         hunks: list[tuple[int, list[str], list[str]]] = []
-        for line in patch.splitlines():
+        for idx, line in enumerate(patch.splitlines()):
             if line.startswith("+++ "):
                 if fcur is not None:
                     fcur["hunks"] = hunks
@@ -517,13 +515,12 @@ class ApplyPatchTool(WorkspaceTool):
             if not m:
                 continue
             ostart = int(m.group("os"))
-            nstart = int(m.group("ns"))
             old_lines: list[str] = []
             new_lines: list[str] = []
-            # accumulate following body lines until the next @@ or ++++
-            body_idx = patch.find(line) + len(line)
-            for bl in patch[body_idx:].splitlines():
-                if bl.startswith("@@") or bl.startswith("+++ "):
+            # accumulate following body lines until the next diff header
+            body = patch.splitlines()[idx + 1:]
+            for bl in body:
+                if bl.startswith(("@@", "+++ ", "--- ")):
                     break
                 c = bl[:1]
                 rest = bl[1:]
@@ -579,7 +576,8 @@ class ApplyPatchTool(WorkspaceTool):
         total_hunks = 0
         applied_hunks = 0
         for fcur in files:
-            name = (fcur["new"] or fcur["old"] or "(unknown)").lstrip("b/").lstrip("a/")
+            name = fcur["new"] or fcur["old"] or "(unknown)"
+            name = name.removeprefix("a/").removeprefix("b/")
             fpath = self.resolve(name)
             if not fpath.is_file():
                 out.append(f"cannot apply {name}: file does not exist")
