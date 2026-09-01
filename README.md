@@ -24,8 +24,9 @@ project, reinstall from the new directory.
 | `providers.py` | the provider layer: ollama / openai / openrouter → chat model |
 | `tools.py` | the workspace tools — knows nothing about models or the console |
 | `harness.py` | the `Harness` agent loop and its console rendering |
-| `main.py` | all command-line code: `chat` and `serve` |
+| `main.py` | all command-line code: `chat`, `serve`, `init-provider` |
 | `api.py` | FastAPI app implementing the OpenAI chat-completions contract |
+| `providers.example.yaml` | reference template for `providers.yaml` |
 
 `Harness.run_events()` is the loop as a stream of events (`step`, `token`, `usage`,
 `message`, `tool`, `result`, `done`, `error`). `Harness.run()` renders those to the
@@ -33,8 +34,16 @@ terminal; the API serializes the same events as SSE. One loop, two front ends.
 
 ## Providers
 
-Pick the model service with `--provider` (ollama is the default). Everything
-else follows from flags, then `.env`, then per-provider defaults:
+**The default provider is ollama.** Run `harness` (or `harness serve`) with no
+`--provider` and it uses ollama, configured from `.env` (`HARNESS_MODEL`,
+`HARNESS_BASE_URL`, or the legacy `OLLAMA_MODEL` / `OLLAMA_HOST`).
+
+Every other provider is selected explicitly with `--provider`, which accepts a
+built-in name (`openai`, `openrouter`) or any name you define in `providers.yaml`
+(see below). The config file is read **only** when `--provider` is given; without
+it the harness never looks at the file.
+
+Built-in providers and their defaults (overridable by flags / `.env`):
 
 | provider | default model | default endpoint | key env var |
 | --- | --- | --- | --- |
@@ -43,6 +52,9 @@ else follows from flags, then `.env`, then per-provider defaults:
 | `openrouter` | `deepseek/deepseek-chat` | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` |
 
 ```bash
+# default: ollama, from .env
+harness
+
 # OpenRouter
 harness --provider openrouter --model deepseek/deepseek-chat
 
@@ -54,9 +66,78 @@ harness serve --provider openai
 ```
 
 The `.env` file is read automatically — `.env` in the launch directory first, then
-the project's own `.env` (copy `.env.example`). Flags always win over env vars. The
-legacy `OLLAMA_MODEL` / `OLLAMA_HOST` names still work for the ollama provider.
+the project's own `.env` (copy `.env.example`). Flags always win over env vars.
 `--num-ctx` only applies to ollama.
+
+## Provider config file (`providers.yaml`)
+
+Named providers are defined in a YAML file and used by name — no code changes
+needed to add a provider. Each entry stores its own `base_url`, `api_key` and
+default `model`; `--provider NAME` selects it, and `--model` overrides the
+entry's default model for that run.
+
+The file is **only read when `--provider` is passed**. Without `--provider` the
+harness uses ollama from `.env` and never touches the config. There is no
+`default` key: the default provider is always ollama.
+
+Search order (first match wins): `--config PATH`, `$HARNESS_CONFIG`,
+`./providers.yaml` in the launch directory, `~/.config/harness/providers.yaml`,
+`%APPDATA%\harness\providers.yaml`.
+
+```yaml
+# providers.yaml
+providers:
+  openrouter:
+    base_url: https://openrouter.ai/api/v1
+    api_key: sk-or-v1-xxxxxxxxxxxxxxxx
+    model: openai/gpt-5.5
+  groq:
+    base_url: https://api.groq.com/openai/v1   # custom names default to the
+    api_key: gsk_xxxx                          # openai protocol (OpenAI-compatible)
+    model: llama-3.3-70b-versatile
+    num_ctx: 16000
+  local:
+    kind: ollama                          # switch the wire protocol if needed
+    base_url: http://127.0.0.1:11434
+    model: qwen3
+```
+
+```bash
+harness --provider openrouter                    # config defaults: endpoint, key, model
+harness --provider openrouter --model openai/gpt-5.5   # override the model for this run
+harness --provider groq --config ~/code/providers.yaml
+```
+
+### Initializing a provider from the command line
+
+The fastest way to add OpenRouter (or any provider) is to let the harness write
+the entry for you:
+
+```bash
+# fully flagged — writes providers.yaml, no prompts
+harness init-provider --name openrouter \
+  --base-url https://openrouter.ai/api/v1 \
+  --api-key sk-or-v1-xxxxxxxxxxxxxxxx \
+  --model openai/gpt-5.5
+
+# interactive — asks for each field and validates the entry
+harness init-provider
+
+# a second provider merges into the same file
+harness init-provider --name groq --base-url https://api.groq.com/openai/v1 \
+  --api-key gsk_xxxx --model llama-3.3-70b-versatile
+```
+
+Pass `--config PATH` to target a specific file (default: `./providers.yaml`).
+Names that match a built-in (openrouter, openai, ollama) inherit its wire
+protocol; custom names (groq, …) default to the openai protocol unless you set
+`--kind`. The reference template ships as `providers.example.yaml`.
+
+Precedence per field: **flag > config entry > env var > built-in default**. A
+config entry named `openrouter`/`openai`/`ollama` inherits that built-in's wire
+protocol; any other name defaults to the `openai` protocol (any OpenAI-compatible
+endpoint) unless the entry sets `kind`. Unknown provider names error with the
+list of known providers.
 
 OpenAI-compatible tool calling is used for `openai`/`openrouter`; Ollama's own
 tool calling for `ollama`. The stored conversation is portable across providers.

@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Command line for the harness: an interactive coding agent, or an API server.
 
-    harness                        # REPL in the current directory
+    harness                        # REPL in the current directory (ollama)
     harness "add type hints"       # one task, then exit
     harness chat --provider openai # use OpenAI (or any compatible endpoint)
+    harness serve --provider openrouter --config providers.yaml
     harness serve --port 8000      # OpenAI-compatible API
 
-Configuration comes from flags, then .env, then provider defaults. Providers:
-ollama (default), openai (and OpenAI-compatible servers), openrouter.
+The default provider is ollama, configured from .env. Any other provider is
+selected explicitly with --provider, which may name a built-in (ollama, openai,
+openrouter) or an entry from providers.yaml; the config file is read only then.
 """
 
 from __future__ import annotations
@@ -21,12 +23,13 @@ from dotenv import load_dotenv
 from rich.panel import Panel
 from rich.table import Table
 
-from harness import DEFAULT_NUM_CTX, RETRY_LIMIT, MODES, Harness, console, normalize_base_url
-from providers import (DEFAULT_BASE_URLS, DEFAULT_MODELS, PROVIDERS,
-                       api_key_from_env)
+from harness import RETRY_LIMIT, MODES, Harness, console, normalize_base_url
+from providers import (DEFAULT_BASE_URLS, DEFAULT_MODELS, DEFAULT_NUM_CTX,
+                       PROVIDERS, Provider, find_config, load_config,
+                       resolve_provider)
 
 VERSION = "0.2.0"
-COMMANDS = ("chat", "serve")
+COMMANDS = ("chat", "serve", "init-provider")
 FENCE = '"""'
 
 
@@ -38,22 +41,151 @@ def pick_env(*names: str) -> str | None:
     return None
 
 
-def provider_config(args: argparse.Namespace) -> tuple[str, str, str, str | None]:
-    """Resolve provider, model, base url and api key: flags -> env -> defaults.
+def load_provider_config(args: argparse.Namespace) -> tuple[dict, Path | None]:
+    """Locate and parse the providers YAML; returns (config, path) or ({}, None)."""
+    cfg_path = find_config(args.config)
+    if args.config and cfg_path is None:
+        console.print(f"[red]provider config not found: {args.config}[/red]")
+        sys.exit(1)
+    if cfg_path is None:
+        return {}, None
+    try:
+        return load_config(cfg_path), cfg_path
+    except (ValueError, OSError) as e:
+        console.print(f"[red]{e}[/red]")
+        sys.exit(1)
 
-    HARNESS_* names are provider-agnostic; the legacy OLLAMA_MODEL / OLLAMA_HOST
-    still work for the ollama provider.
+
+def _ask(prompt: str, default: str | None = None) -> str:
+    """Prompt for a value with an optional default (empty input takes default)."""
+    suffix = f" [{default}]" if default else ""
+    try:
+        value = console.input(f"{prompt}{suffix}: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return default or ""
+    return value or default or ""
+
+
+def _ask_secret(prompt: str) -> str | None:
+    """Prompt for a secret; blank means 'leave it out' (env vars will be used)."""
+    try:
+        value = console.input(f"{prompt} (blank to skip): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return None
+    return value or None
+
+
+def add_provider_to_config(path: Path, name: str, opts: dict) -> None:
+    """Merge one provider entry into the YAML at path (creates the file if needed).
+
+    Keeps existing entries and comments; writes via yaml.dump so the result is
+    always valid. The file is written on a new line-block, opening a mapping.
     """
-    provider = args.provider or pick_env("HARNESS_PROVIDER") or "ollama"
-    model = (args.model or pick_env("HARNESS_MODEL")
-             or (pick_env("OLLAMA_MODEL") if provider == "ollama" else None)
-             or DEFAULT_MODELS[provider])
-    base = (args.base_url
-            or pick_env("HARNESS_BASE_URL")
-            or (pick_env("OLLAMA_HOST") if provider == "ollama" else None)
-            or DEFAULT_BASE_URLS[provider])
-    key = args.api_key or api_key_from_env(provider)
-    return provider, model, base, key
+    import yaml
+
+    from providers import load_config
+
+    existing: dict = {"providers": {}}
+    if path.is_file():
+        try:
+            existing = load_config(path)
+        except ValueError:
+            pass  # start fresh if the file is unparsable; do not clobber below
+    existing.setdefault("providers", {})
+    existing["providers"][name] = opts
+
+    # re-dump, preserving key order (existing entries first)
+    block = yaml.dump(existing, sort_keys=False, allow_unicode=True).rstrip()
+    with path.open("w", encoding="utf-8") as fh:
+        fh.write("# Named providers for the harness. Read only when --provider NAME is given.\n")
+        fh.write("# Without --provider the harness always uses ollama from .env.\n")
+        fh.write(block + "\n")
+
+
+def run_init_provider(args: argparse.Namespace) -> None:
+    """Add a provider to providers.yaml — interactively, or fully via flags.
+
+    ``harness init-provider`` asks for each value; ``harness init-provider
+    --name openrouter --base-url https://openrouter.ai/api/v1 --model
+    openai/gpt-5.5 [--api-key sk-...]`` writes it without prompting.
+    """
+    from providers import PROVIDERS, build_provider_entry
+
+    console.print("[bold]Initialize a provider in providers.yaml[/bold]")
+    path = (Path(args.config).expanduser() if args.config
+            else find_config(None) or Path.cwd() / "providers.yaml")
+
+    # Fully flagged runs (--name + --base-url) skip every prompt; otherwise ask.
+    full = bool(args.name and args.base_url)
+    name = args.name or _ask("provider name (alias)", "openrouter")
+    base = args.base_url or _ask("base_url (API endpoint)",
+                                 "https://openrouter.ai/api/v1")
+    model = args.model or (None if full else
+                           _ask("default model (override per run with --model)"))
+    # Built-in names inherit their protocol; custom names default to openai.
+    if name in PROVIDERS:
+        kind: str | None = None
+    else:
+        kind = args.kind or ("openai" if full else _ask(
+            f"wire protocol ({', '.join(PROVIDERS)}; custom names default to openai)",
+            "openai"))
+        if kind not in PROVIDERS:
+            console.print(f"[red]unknown kind {kind!r} — must be one of {', '.join(PROVIDERS)}[/red]")
+            sys.exit(1)
+    api_key = args.api_key
+    if api_key is None and not full:
+        try:
+            store = console.input("store an api_key in this file? [y/N]: ").strip().lower() in ("y", "yes")
+        except (EOFError, KeyboardInterrupt):
+            store = False
+        api_key = _ask_secret("api_key (sk-…)") if store else None
+
+    entry = {
+        k: v for k, v in build_provider_entry(
+            kind=kind, base_url=base, api_key=api_key, model=model).items()
+        if v is not None
+    }
+    try:
+        resolve_provider(name, config={"providers": {name: entry}})
+    except ValueError as e:
+        console.print(f"[red]invalid entry: {e}[/red]")
+        sys.exit(1)
+    add_provider_to_config(path, name, entry)
+    console.print(f"[green]wrote {name!r} to {path}[/green]")
+    console.print(f"use it with: [bold]harness --provider {name}[/bold] (or --model to override)")
+
+
+def provider_config(args: argparse.Namespace) -> tuple[Provider, Path | None]:
+    """Resolve one concrete Provider from flags + env.
+
+    The providers.yaml config is read only when --provider is given (a named
+    entry or a built-in whose settings the config may override). Without
+    --provider the result is ollama, configured from .env.
+    """
+    if args.provider:
+        config, cfg_path = load_provider_config(args)
+    else:
+        if args.config:
+            console.print("[yellow]--config needs --provider NAME; ignoring "
+                          "--config (default provider is ollama)[/yellow]")
+        config, cfg_path = {}, None
+    try:
+        prov = resolve_provider(
+            args.provider, model=args.model, base_url=args.base_url,
+            api_key=args.api_key, num_ctx=args.num_ctx,
+            temperature=args.temperature, config=config,
+        )
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        sys.exit(1)
+    return prov, cfg_path
+
+
+def provider_label(prov: Provider) -> str:
+    """Display name: the alias, with its wire protocol when they differ."""
+    if prov.label and prov.label != prov.name:
+        return f"{prov.label} ({prov.name})"
+    return prov.label or prov.name
 
 
 def read_block(first_line: str) -> str:
@@ -86,21 +218,25 @@ def read_prompt_file(raw: str) -> str:
 
 
 def common_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--provider", choices=PROVIDERS, default=None,
-                        help="model service: " + ", ".join(PROVIDERS)
-                             + " (default: env HARNESS_PROVIDER or ollama)")
+    parser.add_argument("--provider", default=None,
+                        help="provider: ollama is the default; pick openai, "
+                             "openrouter, or a name from providers.yaml")
+    parser.add_argument("--config", metavar="PATH", default=None,
+                        help="providers.yaml (default: $HARNESS_CONFIG, ./providers.yaml, "
+                             "~/.config/harness/providers.yaml, or the platform app-data "
+                             "dir under harness/providers.yaml)")
     parser.add_argument("--model", default=None,
-                        help=f"model id (default per provider, e.g. {DEFAULT_MODELS['ollama']})")
+                        help=f"model id (overrides the config default, e.g. {DEFAULT_MODELS['ollama']})")
     parser.add_argument("--base-url", default=None,
-                        help="API endpoint (default per provider, e.g. "
+                        help="API endpoint (overrides the config default, e.g. "
                              + DEFAULT_BASE_URLS["ollama"] + ")")
     parser.add_argument("--api-key", default=None,
-                        help="API key: model key for openai/openrouter; on serve "
-                             "it is also the bearer key for /v1 routes "
-                             "(default: HARNESS_API_KEY or the provider's env var)")
+                        help="API key: overrides the config/env key; on serve it is "
+                             "also the bearer key for /v1 routes")
     parser.add_argument("--workspace", default=".")
-    parser.add_argument("--num-ctx", type=int, default=DEFAULT_NUM_CTX,
-                        help="context window (ollama only; default %(default)s)")
+    parser.add_argument("--num-ctx", type=int, default=None,
+                        help="context window for ollama (default: the provider's "
+                             f"config num_ctx or {DEFAULT_NUM_CTX:,})")
     parser.add_argument("--max-steps", type=int, default=0,
                         help="hard cap on model calls per task (0 = no limit)")
     parser.add_argument("--retry-limit", type=int, default=RETRY_LIMIT,
@@ -138,6 +274,16 @@ def build_parser() -> argparse.ArgumentParser:
                        help="deny: read-only tools; allow: let the agent write and run commands")
     serve.add_argument("--cors-origin", action="append", dest="cors_origins",
                        help="allowed browser origin (repeatable; default: any)")
+
+    initp = sub.add_parser("init-provider",
+                           help="interactively add a provider to providers.yaml")
+    initp.add_argument("--config", metavar="PATH", default=None,
+                       help="target file (default: ./providers.yaml or the default locations)")
+    initp.add_argument("--name", default=None, help="provider alias (default: prompted)")
+    initp.add_argument("--base-url", default=None, help="API endpoint (default: prompted)")
+    initp.add_argument("--model", default=None, help="default model (default: prompted)")
+    initp.add_argument("--kind", default=None, help="wire protocol (default: openai)")
+    initp.add_argument("--api-key", default=None, help="store this key in the file")
     return parser
 
 
@@ -179,47 +325,48 @@ def print_stats(agent: Harness) -> None:
     console.print(table)
 
 
-def make_agent(args: argparse.Namespace, workspace: Path,
-               provider: str, model: str, base_url: str, api_key: str | None,
+def make_agent(args: argparse.Namespace, workspace: Path, prov: Provider,
                stream: bool = True) -> Harness:
     try:
         return Harness(
-            model=model, workspace=workspace, base_url=base_url,
+            model=prov.model, workspace=workspace, base_url=prov.endpoint,
             max_steps=args.max_steps, retry_limit=args.retry_limit,
-            mode=args.mode, temperature=args.temperature,
-            num_ctx=args.num_ctx, provider=provider, api_key=api_key,
+            mode=args.mode, temperature=prov.temperature,
+            num_ctx=prov.num_ctx, provider=prov.name, api_key=prov.api_key,
             show_results=args.show_results, stream=stream,
             subagents=args.subagents,
         )
     except ImportError:
-        console.print(f"[red]missing dependency:[/red] {install_hint(provider)}")
+        console.print(f"[red]missing dependency:[/red] {install_hint(prov.name)}")
         sys.exit(1)
 
 
-def startup_panel(provider: str, model: str, base_url: str, workspace: Path,
-                  mode: str, num_ctx: int, tools: int, subagents: bool,
-                  key_set: bool, stream: bool = True) -> None:
+def startup_panel(prov: Provider, base_url: str, workspace: Path,
+                  mode: str, tools: int, subagents: bool,
+                  key_set: bool, cfg_path: Path | None,
+                  stream: bool = True) -> None:
     console.print(Panel.fit(
-        f"[bold]{provider}[/bold] · model [bold]{model}[/bold] @ {base_url}\n"
-        f"context [bold]{num_ctx:,}[/bold] · workspace [bold]{workspace}[/bold]\n"
+        f"[bold]{provider_label(prov)}[/bold] · model [bold]{prov.model}[/bold] @ {base_url}\n"
+        f"context [bold]{prov.num_ctx:,}[/bold] · workspace [bold]{workspace}[/bold]\n"
         f"mode [bold]{mode}[/bold] · {tools} tools"
         f"{'  ·  sub-agents [bold]on[/bold]' if subagents else ''}"
-        f"{'  ·  [yellow]no api key[/yellow]' if provider != 'ollama' and not key_set else ''}",
+        f"{'  ·  config [dim]' + str(cfg_path) + '[/dim]' if cfg_path else ''}"
+        f"{'  ·  [yellow]no api key[/yellow]' if prov.name != 'ollama' and not key_set else ''}",
         title="ollama-harness", border_style="green",
     ))
 
 
 def run_chat(args: argparse.Namespace) -> None:
     workspace = resolve_workspace(args.workspace)
-    provider, model, base_url, api_key = provider_config(args)
-    base_url = normalize_base_url(base_url)
+    prov, cfg_path = provider_config(args)
+    base_url = normalize_base_url(prov.endpoint)
+    prov.base_url = base_url
     stream = not args.no_stream
-    agent = make_agent(args, workspace, provider, model, base_url, api_key,
-                       stream=stream)
+    agent = make_agent(args, workspace, prov, stream=stream)
 
-    startup_panel(provider, model, base_url, workspace, args.mode,
-                  args.num_ctx, len(agent.tools), agent.subagents,
-                  api_key is not None, stream)
+    startup_panel(prov, base_url, workspace, args.mode,
+                  len(agent.tools), agent.subagents,
+                  prov.api_key is not None, cfg_path, stream)
     print_tools(agent)
 
     if args.file:
@@ -288,9 +435,11 @@ def run_chat(args: argparse.Namespace) -> None:
 
 def run_serve(args: argparse.Namespace) -> None:
     workspace = resolve_workspace(args.workspace)
-    provider, model, base_url, _ = provider_config(args)
-    api_key = args.api_key or pick_env("HARNESS_API_KEY")  # serve auth, not model auth
-    base_url = normalize_base_url(base_url)
+    prov, cfg_path = provider_config(args)
+    base_url = normalize_base_url(prov.endpoint)
+    prov.base_url = base_url
+    auth_key = args.api_key or pick_env("HARNESS_API_KEY")  # bearer auth for /v1
+    model_key = args.api_key or prov.api_key               # key the model call uses
     try:
         import uvicorn
 
@@ -300,20 +449,23 @@ def run_serve(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     app = create_app(ServerConfig(
-        model=model, base_url=base_url, workspace=workspace, mode=args.mode,
-        num_ctx=args.num_ctx, max_steps=args.max_steps, retry_limit=args.retry_limit,
-        provider=provider, api_key=api_key,
+        model=prov.model, base_url=base_url, workspace=workspace, mode=args.mode,
+        num_ctx=prov.num_ctx, max_steps=args.max_steps, retry_limit=args.retry_limit,
+        provider=prov.name, api_key=auth_key, model_api_key=model_key,
         cors_origins=args.cors_origins or ["*"],
     ))
 
+    keyed = prov.api_key is not None or auth_key is not None
     exposure = "localhost only" if args.host in ("127.0.0.1", "localhost") else "[bold red]all interfaces[/bold red]"
     console.print(Panel.fit(
         f"[bold]http://{args.host}:{args.port}/v1[/bold]  ({exposure})\n"
-        f"[bold]{provider}[/bold] · model [bold]{model}[/bold] @ {base_url}\n"
+        f"[bold]{provider_label(prov)}[/bold] · model [bold]{prov.model}[/bold] @ {base_url}\n"
         f"workspace [bold]{workspace}[/bold]\n"
         f"mode [bold]{args.mode}[/bold]"
         f"{'' if args.mode == 'deny' else '  [yellow](the agent can write files and run commands)[/yellow]'}\n"
-        f"auth [bold]{'bearer key' if api_key else 'none'}[/bold]",
+        f"auth [bold]{'bearer key' if auth_key else 'none'}[/bold]"
+        f"{'  ·  [yellow]no model key[/yellow]' if prov.name != 'ollama' and not keyed else ''}"
+        f"{'  ·  config [dim]' + str(cfg_path) + '[/dim]' if cfg_path else ''}",
         title="ollama-harness serve", border_style="green",
     ))
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
@@ -327,7 +479,10 @@ def main(argv: list[str] | None = None) -> None:
     if not argv or argv[0] not in COMMANDS and argv[0] not in ("-h", "--help", "--version"):
         argv.insert(0, "chat")   # bare invocation, flags, or a query all mean chat
     args = build_parser().parse_args(argv)
-    (run_serve if args.command == "serve" else run_chat)(args)
+    if args.command == "init-provider":
+        run_init_provider(args)
+    else:
+        (run_serve if args.command == "serve" else run_chat)(args)
 
 
 if __name__ == "__main__":

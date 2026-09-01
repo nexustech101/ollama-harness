@@ -6,6 +6,7 @@ dist/
 wheels/
 *.egg-info
 .playwright
+.pytest_cache/
 
 # Virtual environments
 .venv
@@ -13,4 +14,4 @@ wheels/
 .python-version
 
 # Miscellaneous
-PLAN.md
+providers.yaml

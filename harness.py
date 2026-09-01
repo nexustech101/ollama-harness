@@ -29,7 +29,7 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.text import Text
 
-from providers import Provider
+from providers import DEFAULT_NUM_CTX, Provider
 from tools import DESTRUCTIVE, ToolArgs, create_tools, describe_environment, truncate
 
 console = Console()
@@ -42,7 +42,6 @@ THINK_TAGS = re.compile(r"</?think>")
 REPEAT_LIMIT = 3      # identical failing tool calls tolerated before abandoning
 RETRY_LIMIT = 5       # consecutive tool failures tolerated before abandoning
 STEP_CEILING = 1_000  # backstop against a loop that never terminates
-DEFAULT_NUM_CTX = 200_000  # single source of truth for the default context window
 
 
 class StreamView:

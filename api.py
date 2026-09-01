@@ -21,7 +21,8 @@ from fastapi.responses import StreamingResponse
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from pydantic import BaseModel
 
-from harness import DEFAULT_NUM_CTX, Harness, fmt_args
+from providers import DEFAULT_NUM_CTX
+from harness import Harness, fmt_args
 
 
 @dataclass
@@ -36,7 +37,8 @@ class ServerConfig:
     max_steps: int = 0          # 0 = no limit; retry_limit ends stuck runs
     retry_limit: int = 5
     provider: str = "ollama"
-    api_key: Optional[str] = None
+    api_key: Optional[str] = None       # bearer auth for /v1 routes
+    model_api_key: Optional[str] = None  # key the model call uses (config/env resolved)
     subagents: bool = False
     cors_origins: list[str] = field(default_factory=lambda: ["*"])
 
@@ -121,7 +123,7 @@ def create_app(config: ServerConfig) -> FastAPI:
             max_steps=request.max_steps if request.max_steps is not None else config.max_steps,
             retry_limit=config.retry_limit,
             provider=config.provider,
-            api_key=config.api_key,
+            api_key=config.model_api_key,
             subagents=config.subagents,
             mode=config.mode,
             temperature=request.temperature,
