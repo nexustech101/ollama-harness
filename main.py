@@ -552,7 +552,7 @@ def run_chat(args: argparse.Namespace) -> None:
                 continue
             if cmd == "models":
                 if agent.models:
-                    console.print(f"[dim]available models:[/dim] "
+                    console.print("[dim]available models:[/dim] "
                                   + ", ".join(agent.models))
                 else:
                     console.print("[dim]this provider lists no curated models — "

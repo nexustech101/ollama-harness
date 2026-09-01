@@ -8,7 +8,6 @@ to the console. Tools live in tools.py; the CLI lives in main.py.
 from __future__ import annotations
 
 import json
-import platform
 import re
 import sys
 import time
@@ -96,7 +95,7 @@ def summarize(result: str, limit: int = 120) -> str:
     lines = result.splitlines() or [""]
     head = " ".join(lines[0].split())[:limit]
     if result.startswith("Error"):
-        return " / ".join(" ".join(l.split()) for l in lines[:3] if l.strip())[:3 * limit]
+        return " / ".join(" ".join(ln.split()) for ln in lines[:3] if ln.strip())[:3 * limit]
     if len(lines) == 1:
         return head or f"{len(result):,} chars"
     return f"{head}  ·  {len(lines)} lines, {len(result):,} chars"
