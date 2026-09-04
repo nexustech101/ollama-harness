@@ -11,9 +11,10 @@ from __future__ import annotations
 import json
 import time
 import uuid
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,8 +22,10 @@ from fastapi.responses import StreamingResponse
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from pydantic import BaseModel
 
-from providers import DEFAULT_NUM_CTX
+from domain.events import VERSION
 from harness import Harness, fmt_args
+from providers import DEFAULT_NUM_CTX
+from server.native import create_native_router
 
 
 @dataclass
@@ -32,47 +35,50 @@ class ServerConfig:
     model: str
     base_url: str
     workspace: Path
-    mode: str = "deny"          # deny (read-only) / ask (unusable headless) / allow
+    mode: str = "deny"  # deny (read-only) / ask (unusable headless) / allow
     num_ctx: int = DEFAULT_NUM_CTX
-    max_steps: int = 0          # 0 = no limit; retry_limit ends stuck runs
+    max_steps: int = 0  # 0 = no limit; retry_limit ends stuck runs
     retry_limit: int = 5
     provider: str = "ollama"
-    api_key: Optional[str] = None       # bearer auth for /v1 routes
-    model_api_key: Optional[str] = None  # key the model call uses (config/env resolved)
+    api_key: str | None = None  # bearer auth for /v1 routes
+    model_api_key: str | None = None  # key the model call uses (config/env resolved)
     subagents: bool = False
+    rollback: str = "none"
     cors_origins: list[str] = field(default_factory=lambda: ["*"])
-    models: tuple[str, ...] = ()    # curated model ids from the config entry
+    models: tuple[str, ...] = ()  # curated model ids from the config entry
 
 
 # ---------------------------------------------------------------------------
 # Request / response bodies (unknown fields from OpenAI clients are ignored)
 # ---------------------------------------------------------------------------
 
+
 class Message(BaseModel):
     role: str
-    content: Optional[str] = ""
+    content: str | None = ""
 
 
 class ChatRequest(BaseModel):
     messages: list[Message]
-    model: Optional[str] = None
+    model: str | None = None
     stream: bool = False
     temperature: float = 0.0
-    max_steps: Optional[int] = None
+    max_steps: int | None = None
 
 
-def _completion(request_id: str, created: int, model: str, text: str,
-                usage: dict[str, int]) -> dict[str, Any]:
+def _completion(request_id: str, created: int, model: str, text: str, usage: dict[str, int]) -> dict[str, Any]:
     return {
         "id": request_id,
         "object": "chat.completion",
         "created": created,
         "model": model,
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": text},
-            "finish_reason": "stop",
-        }],
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": "stop",
+            }
+        ],
         # summed across every step of the agent loop, as reported by Ollama
         "usage": usage,
     }
@@ -87,8 +93,7 @@ def _usage(agent: Harness) -> dict[str, int]:
     }
 
 
-def _chunk(request_id: str, created: int, model: str, delta: dict[str, Any],
-           finish: Optional[str] = None) -> str:
+def _chunk(request_id: str, created: int, model: str, delta: dict[str, Any], finish: str | None = None) -> str:
     body = {
         "id": request_id,
         "object": "chat.completion.chunk",
@@ -100,8 +105,9 @@ def _chunk(request_id: str, created: int, model: str, delta: dict[str, Any],
 
 
 def create_app(config: ServerConfig) -> FastAPI:
-    app = FastAPI(title="ollama-harness", version="0.1.0",
-                  description="OpenAI-compatible API for a local coding agent.")
+    app = FastAPI(
+        title="ollama-harness", version=VERSION, description="OpenAI-compatible API for a local coding agent."
+    )
     app.add_middleware(
         CORSMiddleware,
         allow_origins=config.cors_origins,
@@ -109,7 +115,7 @@ def create_app(config: ServerConfig) -> FastAPI:
         allow_headers=["*"],
     )
 
-    def authorize(authorization: Optional[str]) -> None:
+    def authorize(authorization: str | None) -> None:
         if not config.api_key:
             return
         if authorization != f"Bearer {config.api_key}":
@@ -120,9 +126,8 @@ def create_app(config: ServerConfig) -> FastAPI:
         model = request.model or config.model
         if request.model and config.models and request.model not in config.models:
             raise HTTPException(
-                status_code=400,
-                detail=f"unknown model {request.model!r}. Available: "
-                       f"{', '.join(config.models)}")
+                status_code=400, detail=f"unknown model {request.model!r}. Available: {', '.join(config.models)}"
+            )
         agent = Harness(
             model=model,
             workspace=config.workspace,
@@ -132,6 +137,7 @@ def create_app(config: ServerConfig) -> FastAPI:
             provider=config.provider,
             api_key=config.model_api_key,
             subagents=config.subagents,
+            rollback=config.rollback,
             mode=config.mode,
             temperature=request.temperature,
             num_ctx=config.num_ctx,
@@ -149,6 +155,8 @@ def create_app(config: ServerConfig) -> FastAPI:
             raise HTTPException(status_code=400, detail="the last message must have role 'user'")
         return agent, agent.messages.pop().content
 
+    app.include_router(create_native_router(config))
+
     @app.get("/health")
     def health() -> dict[str, Any]:
         return {
@@ -160,21 +168,24 @@ def create_app(config: ServerConfig) -> FastAPI:
         }
 
     @app.get("/v1/models")
-    def models(authorization: Optional[str] = Header(None)) -> dict[str, Any]:
+    def models(authorization: str | None = Header(None)) -> dict[str, Any]:
         authorize(authorization)
         ids = list(config.models) or [config.model]
         return {
             "object": "list",
-            "data": [{
-                "id": model_id,
-                "object": "model",
-                "created": int(time.time()),
-                "owned_by": "ollama-harness",
-            } for model_id in ids],
+            "data": [
+                {
+                    "id": model_id,
+                    "object": "model",
+                    "created": int(time.time()),
+                    "owned_by": "ollama-harness",
+                }
+                for model_id in ids
+            ],
         }
 
     @app.post("/v1/chat/completions")
-    def chat_completions(request: ChatRequest, authorization: Optional[str] = Header(None)):
+    def chat_completions(request: ChatRequest, authorization: str | None = Header(None)):
         authorize(authorization)
         agent, query = build_agent(request)
         model = request.model or config.model
@@ -197,30 +208,30 @@ def create_app(config: ServerConfig) -> FastAPI:
                     kind = event["type"]
                     if kind == "token":
                         # the model's own output, including any <think> block
-                        yield _chunk(request_id, created, model,
-                                     {"reasoning_content": event["text"]})
+                        yield _chunk(request_id, created, model, {"reasoning_content": event["text"]})
                     elif kind == "tool":
-                        yield _chunk(request_id, created, model, {"reasoning_content":
-                                     f"\n→ {event['name']}  {fmt_args(event['args'])}\n"})
+                        yield _chunk(
+                            request_id,
+                            created,
+                            model,
+                            {"reasoning_content": f"\n→ {event['name']}  {fmt_args(event['args'])}\n"},
+                        )
                     elif kind == "result":
-                        yield _chunk(request_id, created, model,
-                                     {"reasoning_content": f"  {event['summary']}\n"})
+                        yield _chunk(request_id, created, model, {"reasoning_content": f"  {event['summary']}\n"})
                     elif kind == "done":
                         yield _chunk(request_id, created, model, {"content": event["text"]})
                     elif kind == "error":
-                        yield _chunk(request_id, created, model,
-                                     {"content": f"\n[error] {event['text']}"})
+                        yield _chunk(request_id, created, model, {"content": f"\n[error] {event['text']}"})
             except Exception as e:  # a stream cannot change its status code
-                yield _chunk(request_id, created, model,
-                             {"content": f"\n[error] {type(e).__name__}: {e}"})
+                yield _chunk(request_id, created, model, {"content": f"\n[error] {type(e).__name__}: {e}"})
             final = _chunk(request_id, created, model, {}, finish="stop")
             body = json.loads(final[6:])
-            body["usage"] = _usage(agent)          # clients with include_usage read this
+            body["usage"] = _usage(agent)  # clients with include_usage read this
             yield f"data: {json.dumps(body)}\n\n"
             yield "data: [DONE]\n\n"
 
-        return StreamingResponse(stream(), media_type="text/event-stream",
-                                 headers={"Cache-Control": "no-cache",
-                                          "X-Accel-Buffering": "no"})
+        return StreamingResponse(
+            stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+        )
 
     return app

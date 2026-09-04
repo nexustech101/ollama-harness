@@ -4,7 +4,14 @@ from __future__ import annotations
 
 import pytest
 
-from tools import ApplyPatchTool, ReadFileTool, WriteFileTool
+from tools import (
+    ApplyPatchTool,
+    ReadFileTool,
+    RunTestsTool,
+    WriteFileTool,
+    describe_environment,
+    find_project_python,
+)
 
 
 def test_write_refuses_escape(tmp_path):
@@ -70,11 +77,7 @@ def test_apply_patch_multiple_hunks(tmp_path):
     f = tmp_path / "a.txt"
     f.write_text("one\ntwo\nthree\n", encoding="utf-8")
     tool = ApplyPatchTool(workspace_root=tmp_path)
-    patch = (
-        "--- a/a.txt\n+++ b/a.txt\n"
-        "@@ -1,3 +1,3 @@\n one\n-two\n+2\n three\n"
-        "@@ -3,1 +3,1 @@\n-three\n+3\n"
-    )
+    patch = "--- a/a.txt\n+++ b/a.txt\n@@ -1,3 +1,3 @@\n one\n-two\n+2\n three\n@@ -3,1 +3,1 @@\n-three\n+3\n"
     out = tool.invoke({"patch": patch, "fuzz": 0})
     assert "applied 2/2 hunk(s)" in out
     assert f.read_text(encoding="utf-8") == "one\n2\n3"
@@ -86,7 +89,8 @@ def test_apply_patch_failed_hunk_reports_partial(tmp_path):
     tool = ApplyPatchTool(workspace_root=tmp_path)
     patch = "--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,2 @@\n-one\n-missing\n+1\n+2\n"
     out = tool.invoke({"patch": patch, "fuzz": 0})
-    assert "FAILED" in out and "0/1" in out
+    assert "cannot apply" in out
+    assert "no files were changed" in out
     assert f.read_text(encoding="utf-8") == "one\n"
 
 
@@ -104,3 +108,93 @@ def test_apply_patch_multiple_files(tmp_path):
     assert "applied 2/2 hunk(s)" in out
     assert (tmp_path / "a.py").read_text(encoding="utf-8") == "def f():\n    return 2"
     assert (tmp_path / "b.txt").read_text(encoding="utf-8") == "goodbye"
+
+
+# ---------------------------------------------------------------------------
+# Project interpreter: tools that run the project's code must use the project
+# venv, not the harness's own interpreter (report item #6: run_tests -> 0 tests
+# because the harness python lacked the project's dependencies).
+# ---------------------------------------------------------------------------
+
+
+def test_find_project_python_prefers_dot_venv(tmp_path):
+    (tmp_path / ".venv" / "Scripts").mkdir(parents=True)
+    (tmp_path / ".venv" / "Scripts" / "python.exe").write_text("", encoding="utf-8")
+    assert find_project_python(tmp_path) == str(tmp_path / ".venv" / "Scripts" / "python.exe")
+
+
+def test_find_project_python_falls_back_to_venv(tmp_path):
+    (tmp_path / "venv" / "bin").mkdir(parents=True)
+    (tmp_path / "venv" / "bin" / "python").write_text("", encoding="utf-8")
+    assert find_project_python(tmp_path) == str(tmp_path / "venv" / "bin" / "python")
+
+
+def test_find_project_python_falls_back_to_harness(tmp_path):
+    import sys
+
+    assert find_project_python(tmp_path) == sys.executable
+
+
+def test_run_tests_uses_project_python(tmp_path, monkeypatch):
+    """run_tests must invoke the project venv's python, not the harness's."""
+    import sys
+
+    import tools
+
+    (tmp_path / ".venv" / "Scripts").mkdir(parents=True)
+    venv_py = tmp_path / ".venv" / "Scripts" / "python.exe"
+    venv_py.write_text("", encoding="utf-8")
+
+    captured: list = []
+
+    def fake_run_proc(cmd, cwd, timeout):
+        captured.append(cmd)
+        return "exit_code: 0\nstdout:\n3 passed in 0.1s"
+
+    monkeypatch.setattr(tools, "run_proc", fake_run_proc)
+    tool = RunTestsTool(workspace_root=tmp_path)
+    out = tool._run()
+    assert captured and captured[0][0] == str(venv_py)
+    assert captured[0][1:3] == ["-m", "pytest"]
+    assert out.startswith("Tests: 3 passed")
+    # sanity: the harness interpreter is a different path from the project venv
+    assert str(venv_py) != sys.executable
+
+
+def test_run_tests_summarize_surfaces_raw_output_when_no_result(tmp_path):
+    """A collection error / missing interpreter must not be masked as 0 tests."""
+    tool = RunTestsTool(workspace_root=tmp_path)
+    raw = (
+        "exit_code: 2\nstderr:\nERROR collecting tests/test_x.py\nModuleNotFoundError: No module named 'langchain_core'"
+    )
+    out = tool._summarize(raw)
+    assert "did not report a result" in out
+    assert "ModuleNotFoundError" in out
+    assert "Tests: 0 passed" not in out
+
+
+def test_run_tests_summarize_still_counts_results(tmp_path):
+    tool = RunTestsTool(workspace_root=tmp_path)
+    raw = "exit_code: 1\nstdout:\nFAILED tests/a.py::t1\n1 failed, 2 passed in 0.2s"
+    out = tool._summarize(raw)
+    assert "Tests: 2 passed, 1 failed" in out
+    assert "tests/a.py::t1" in out
+
+
+def test_apply_patch_no_hunks_is_diagnostic(tmp_path):
+    """File headers without @@ hunk headers must explain what is missing."""
+    (tmp_path / "a.txt").write_text("one\n", encoding="utf-8")
+    tool = ApplyPatchTool(workspace_root=tmp_path)
+    patch = "--- a/a.txt\n+++ b/a.txt\n-old\n+new\n"  # no @@ header
+    out = tool.invoke({"patch": patch, "fuzz": 0})
+    assert "no hunks" in out
+    assert "@@" in out  # tells the model the hunk header is required
+    assert "Each change needs" in out
+
+
+def test_describe_environment_mentions_project_venv(tmp_path):
+    (tmp_path / ".venv" / "Scripts").mkdir(parents=True)
+    (tmp_path / ".venv" / "Scripts" / "python.exe").write_text("", encoding="utf-8")
+    env = describe_environment(tmp_path)
+    assert "project venv" in env
+    assert str(tmp_path / ".venv" / "Scripts" / "python.exe") in env

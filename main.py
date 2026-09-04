@@ -23,12 +23,21 @@ from dotenv import load_dotenv
 from rich.panel import Panel
 from rich.table import Table
 
-from harness import RETRY_LIMIT, MODES, Harness, console, normalize_base_url
-from providers import (DEFAULT_BASE_URLS, DEFAULT_MODELS, DEFAULT_NUM_CTX,
-                       PROVIDERS, Provider, default_config_path, find_config,
-                       load_config, resolve_provider)
+from domain.events import VERSION as CANONICAL_VERSION
+from harness import MODES, RETRY_LIMIT, Harness, console, normalize_base_url
+from providers import (
+    DEFAULT_BASE_URLS,
+    DEFAULT_MODELS,
+    DEFAULT_NUM_CTX,
+    PROVIDERS,
+    Provider,
+    default_config_path,
+    find_config,
+    load_config,
+    resolve_provider,
+)
 
-VERSION = "0.2.0"
+VERSION = CANONICAL_VERSION
 COMMANDS = ("chat", "serve", "init-provider")
 FENCE = '"""'
 
@@ -112,31 +121,29 @@ def run_init_provider(args: argparse.Namespace) -> None:
     from providers import PROVIDERS, build_provider_entry
 
     console.print("[bold]Initialize a provider in providers.yaml[/bold]")
-    path = (Path(args.config).expanduser() if args.config
-            else find_config(None) or default_config_path())
+    path = Path(args.config).expanduser() if args.config else find_config(None) or default_config_path()
 
     # Fully flagged runs (--name + --base-url, or --models) skip prompts.
     full = bool((args.name and args.base_url) or args.models)
     name = args.name or _ask("provider name (alias)", "openrouter")
-    base = args.base_url or _ask("base_url (API endpoint)",
-                                 "https://openrouter.ai/api/v1")
+    base = args.base_url or _ask("base_url (API endpoint)", "https://openrouter.ai/api/v1")
     if args.model and args.models:
         console.print("[red]--model and --models are mutually exclusive — pass one[/red]")
         sys.exit(1)
-    models = ([m.strip() for m in args.models.split(",") if m.strip()]
-              if args.models else None)
+    models = [m.strip() for m in args.models.split(",") if m.strip()] if args.models else None
     if models and any(not m for m in models):
         console.print("[red]--models needs a comma-separated list of model ids[/red]")
         sys.exit(1)
-    model = args.model or (None if (full or models)
-                           else _ask("default model (override per run with --model)"))
+    model = args.model or (None if (full or models) else _ask("default model (override per run with --model)"))
     # Built-in names inherit their protocol; custom names default to openai.
     if name in PROVIDERS:
         kind: str | None = None
     else:
-        kind = args.kind or ("openai" if full else _ask(
-            f"wire protocol ({', '.join(PROVIDERS)}; custom names default to openai)",
-            "openai"))
+        kind = args.kind or (
+            "openai"
+            if full
+            else _ask(f"wire protocol ({', '.join(PROVIDERS)}; custom names default to openai)", "openai")
+        )
         if kind not in PROVIDERS:
             console.print(f"[red]unknown kind {kind!r} — must be one of {', '.join(PROVIDERS)}[/red]")
             sys.exit(1)
@@ -157,9 +164,10 @@ def run_init_provider(args: argparse.Namespace) -> None:
     else:
         default_model = None
     entry = {
-        k: v for k, v in build_provider_entry(
-            kind=kind, base_url=base, api_key=api_key,
-            default_model=default_model, models=models).items()
+        k: v
+        for k, v in build_provider_entry(
+            kind=kind, base_url=base, api_key=api_key, default_model=default_model, models=models
+        ).items()
         if v is not None
     }
     try:
@@ -169,9 +177,11 @@ def run_init_provider(args: argparse.Namespace) -> None:
         sys.exit(1)
     add_provider_to_config(path, name, entry)
     console.print(f"[green]wrote {name!r} to {path}[/green]")
-    console.print(f"use it with: [bold]harness --provider {name}[/bold] "
-                  f"(defaults to {default_model or 'the first model'}; "
-                  f"--model overrides per run)")
+    console.print(
+        f"use it with: [bold]harness --provider {name}[/bold] "
+        f"(defaults to {default_model or 'the first model'}; "
+        f"--model overrides per run)"
+    )
 
 
 def run_add_model(args: argparse.Namespace) -> None:
@@ -182,11 +192,11 @@ def run_add_model(args: argparse.Namespace) -> None:
     from providers import load_config
 
     if not args.provider:
-        console.print("[red]--add needs --provider NAME (e.g. "
-                      "--provider openrouter --add deepseek/deepseek-v4-flash-0731)[/red]")
+        console.print(
+            "[red]--add needs --provider NAME (e.g. --provider openrouter --add deepseek/deepseek-v4-flash-0731)[/red]"
+        )
         sys.exit(1)
-    path = (Path(args.config).expanduser() if args.config
-            else find_config(None) or default_config_path())
+    path = Path(args.config).expanduser() if args.config else find_config(None) or default_config_path()
 
     entries: dict[str, dict] = {}
     if path.is_file():
@@ -216,10 +226,10 @@ def run_add_model(args: argparse.Namespace) -> None:
     add_provider_to_config(path, args.provider, entry)
     console.print(f"[green]added {args.add} to provider {args.provider} ({path})[/green]")
     if args.provider not in PROVIDERS and not entry.get("base_url"):
-        console.print("[dim]this provider has no base_url — set one in the YAML "
-                      "or re-run with harness init-provider[/dim]")
-    console.print(f"use it with: [bold]harness --provider {args.provider} "
-                  f"--model {args.add}[/bold]")
+        console.print(
+            "[dim]this provider has no base_url — set one in the YAML or re-run with harness init-provider[/dim]"
+        )
+    console.print(f"use it with: [bold]harness --provider {args.provider} --model {args.add}[/bold]")
 
 
 def run_set_default_model(args: argparse.Namespace) -> None:
@@ -234,16 +244,17 @@ def run_set_default_model(args: argparse.Namespace) -> None:
     from providers import load_config
 
     if not args.provider:
-        console.print("[red]--set-default needs --provider NAME (e.g. "
-                      "--provider openrouter --set-default "
-                      "deepseek/deepseek-v4-flash-0731)[/red]")
+        console.print(
+            "[red]--set-default needs --provider NAME (e.g. "
+            "--provider openrouter --set-default "
+            "deepseek/deepseek-v4-flash-0731)[/red]"
+        )
         sys.exit(1)
     if not args.set_default:
         console.print("[red]--set-default needs a model id[/red]")
         sys.exit(1)
     new = args.set_default
-    path = (Path(args.config).expanduser() if args.config
-            else find_config(None) or default_config_path())
+    path = Path(args.config).expanduser() if args.config else find_config(None) or default_config_path()
 
     entries: dict[str, dict] = {}
     if path.is_file():
@@ -255,14 +266,15 @@ def run_set_default_model(args: argparse.Namespace) -> None:
 
     entry = dict(entries.get(args.provider) or {})
     entry["default"] = new
-    entry.pop("model", None)   # legacy alias superseded by the default field
+    entry.pop("model", None)  # legacy alias superseded by the default field
     models = entry.get("models")
     if models and new not in models:
-        console.print(f"[yellow]note: {new} is not in {args.provider}'s models "
-                      f"list — add it with --add, or it will only be the default[/yellow]")
+        console.print(
+            f"[yellow]note: {new} is not in {args.provider}'s models "
+            f"list — add it with --add, or it will only be the default[/yellow]"
+        )
     # deterministic key order in the written file (unknown keys preserved)
-    ordered = {k: entry[k] for k in ("kind", "base_url", "api_key", "default",
-                                     "models", "num_ctx") if k in entry}
+    ordered = {k: entry[k] for k in ("kind", "base_url", "api_key", "default", "models", "num_ctx") if k in entry}
     entry = {**ordered, **{k: v for k, v in entry.items() if k not in ordered}}
 
     try:
@@ -274,10 +286,12 @@ def run_set_default_model(args: argparse.Namespace) -> None:
     add_provider_to_config(path, args.provider, entry)
     console.print(f"[green]default model for {args.provider} is now {new} ({path})[/green]")
     if args.provider not in PROVIDERS and not entry.get("base_url"):
-        console.print("[dim]this provider has no base_url — set one in the YAML "
-                      "or re-run with harness init-provider[/dim]")
-    console.print(f"use it with: [bold]harness --provider {args.provider}[/bold] "
-                  f"(defaults to {new}; --model overrides per run)")
+        console.print(
+            "[dim]this provider has no base_url — set one in the YAML or re-run with harness init-provider[/dim]"
+        )
+    console.print(
+        f"use it with: [bold]harness --provider {args.provider}[/bold] (defaults to {new}; --model overrides per run)"
+    )
 
 
 def provider_config(args: argparse.Namespace) -> tuple[Provider, Path | None]:
@@ -291,14 +305,19 @@ def provider_config(args: argparse.Namespace) -> tuple[Provider, Path | None]:
         config, cfg_path = load_provider_config(args)
     else:
         if args.config:
-            console.print("[yellow]--config needs --provider NAME; ignoring "
-                          "--config (default provider is ollama)[/yellow]")
+            console.print(
+                "[yellow]--config needs --provider NAME; ignoring --config (default provider is ollama)[/yellow]"
+            )
         config, cfg_path = {}, None
     try:
         prov = resolve_provider(
-            args.provider, model=args.model, base_url=args.base_url,
-            api_key=args.api_key, num_ctx=args.num_ctx,
-            temperature=args.temperature, config=config,
+            args.provider,
+            model=args.model,
+            base_url=args.base_url,
+            api_key=args.api_key,
+            num_ctx=args.num_ctx,
+            temperature=args.temperature,
+            config=config,
         )
     except ValueError as e:
         console.print(f"[red]{e}[/red]")
@@ -313,7 +332,8 @@ def provider_config(args: argparse.Namespace) -> tuple[Provider, Path | None]:
             "           ~/.config/harness/providers.yaml\n"
             "  fix:     put your providers.yaml in one of those places, or run\n"
             f"           [bold]harness --provider {args.provider} "
-            "--config PATH[/bold]")
+            "--config PATH[/bold]"
+        )
     return prov, cfg_path
 
 
@@ -327,7 +347,7 @@ def provider_label(prov: Provider) -> str:
 def read_block(first_line: str) -> str:
     """Collect a \"\"\"-fenced task. Pasting a block after the opening fence works:
     every pasted line is consumed here instead of firing as its own task."""
-    body = [first_line[len(FENCE):]]
+    body = [first_line[len(FENCE) :]]
     console.print(f"[dim]multi-line — close with {FENCE} on its own line[/dim]")
     while True:
         try:
@@ -335,7 +355,7 @@ def read_block(first_line: str) -> str:
         except (EOFError, KeyboardInterrupt):
             break
         if line.rstrip().endswith(FENCE):
-            body.append(line.rstrip()[:-len(FENCE)])
+            body.append(line.rstrip()[: -len(FENCE)])
             break
         body.append(line)
     return "\n".join(body).strip()
@@ -354,79 +374,105 @@ def read_prompt_file(raw: str) -> str:
 
 
 def common_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--provider", default=None,
-                        help="provider: ollama is the default; pick openai, "
-                             "openrouter, or a name from providers.yaml")
-    parser.add_argument("--config", metavar="PATH", default=None,
-                        help="providers.yaml (default: $HARNESS_CONFIG, "
-                             "then %APPDATA%\\harness\\providers.yaml or "
-                             "~/.config/harness/providers.yaml)")
-    parser.add_argument("--model", default=None,
-                        help=f"model id (overrides the config default, e.g. {DEFAULT_MODELS['ollama']})")
-    parser.add_argument("--base-url", default=None,
-                        help="API endpoint (overrides the config default, e.g. "
-                             + DEFAULT_BASE_URLS["ollama"] + ")")
-    parser.add_argument("--api-key", default=None,
-                        help="API key: overrides the config/env key; on serve it is "
-                             "also the bearer key for /v1 routes")
+    parser.add_argument(
+        "--provider",
+        default=None,
+        help="provider: ollama is the default; pick openai, openrouter, or a name from providers.yaml",
+    )
+    parser.add_argument(
+        "--config",
+        metavar="PATH",
+        default=None,
+        help="providers.yaml (default: $HARNESS_CONFIG, "
+        "then %%APPDATA%%\\harness\\providers.yaml or "
+        "~/.config/harness/providers.yaml)",
+    )
+    parser.add_argument(
+        "--model", default=None, help=f"model id (overrides the config default, e.g. {DEFAULT_MODELS['ollama']})"
+    )
+    parser.add_argument(
+        "--base-url",
+        default=None,
+        help="API endpoint (overrides the config default, e.g. " + DEFAULT_BASE_URLS["ollama"] + ")",
+    )
+    parser.add_argument(
+        "--api-key",
+        default=None,
+        help="API key: overrides the config/env key; on serve it is also the bearer key for /v1 routes",
+    )
     parser.add_argument("--workspace", default=".")
-    parser.add_argument("--num-ctx", type=int, default=None,
-                        help="context window for ollama (default: the provider's "
-                             f"config num_ctx or {DEFAULT_NUM_CTX:,})")
-    parser.add_argument("--max-steps", type=int, default=0,
-                        help="hard cap on model calls per task (0 = no limit)")
-    parser.add_argument("--retry-limit", type=int, default=RETRY_LIMIT,
-                        help="consecutive tool failures before a task is abandoned")
+    parser.add_argument(
+        "--num-ctx",
+        type=int,
+        default=None,
+        help=f"context window for ollama (default: the provider's config num_ctx or {DEFAULT_NUM_CTX:,})",
+    )
+    parser.add_argument("--max-steps", type=int, default=0, help="hard cap on model calls per task (0 = no limit)")
+    parser.add_argument(
+        "--retry-limit", type=int, default=RETRY_LIMIT, help="consecutive tool failures before a task is abandoned"
+    )
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--add", default=None, metavar="MODEL_ID",
-                        help="add this model id to --provider's models list in "
-                             "providers.yaml, then exit (with --provider NAME)")
-    parser.add_argument("--set-default", default=None, metavar="MODEL_ID",
-                        help="set --provider's default model in providers.yaml "
-                             "(replaces the existing model: field), then exit "
-                             "(with --provider NAME)")
+    parser.add_argument(
+        "--add",
+        default=None,
+        metavar="MODEL_ID",
+        help="add this model id to --provider's models list in providers.yaml, then exit (with --provider NAME)",
+    )
+    parser.add_argument(
+        "--set-default",
+        default=None,
+        metavar="MODEL_ID",
+        help="set --provider's default model in providers.yaml "
+        "(replaces the existing model: field), then exit "
+        "(with --provider NAME)",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=Path(sys.argv[0]).stem or "harness",
-        description="A small coding agent with pluggable model providers "
-                    "(ollama, openai, openrouter).",
+        description="A small coding agent with pluggable model providers (ollama, openai, openrouter).",
     )
     parser.add_argument("--version", action="version", version=f"ollama-harness {VERSION}")
     sub = parser.add_subparsers(dest="command", required=True)
 
     chat = sub.add_parser("chat", help="interactive coding agent (default)")
     common_args(chat)
-    chat.add_argument("--mode", choices=MODES, default="ask",
-                      help="allow: run mutating tools; ask: confirm each; deny: read-only")
+    chat.add_argument(
+        "--mode", choices=MODES, default="ask", help="allow: run mutating tools; ask: confirm each; deny: read-only"
+    )
     chat.add_argument("--no-stream", action="store_true", help="disable token streaming")
-    chat.add_argument("--show-results", action="store_true",
-                      help="print full tool output instead of a one-line summary")
-    chat.add_argument("--subagents", action="store_true",
-                      help="offer the spawn_agent tool (off by default)")
-    chat.add_argument("--file", metavar="PATH",
-                      help="run a task read from a file, then exit")
+    chat.add_argument(
+        "--show-results", action="store_true", help="print full tool output instead of a one-line summary"
+    )
+    chat.add_argument("--subagents", action="store_true", help="offer the spawn_agent tool (off by default)")
+    chat.add_argument("--file", metavar="PATH", help="run a task read from a file, then exit")
     chat.add_argument("query", nargs="*", help="run one task and exit")
 
     serve = sub.add_parser("serve", help="serve the OpenAI-compatible API")
     common_args(serve)
     serve.add_argument("--host", default="127.0.0.1", help="bind address (default: localhost only)")
     serve.add_argument("--port", type=int, default=8000)
-    serve.add_argument("--mode", choices=("allow", "deny"), default="deny",
-                       help="deny: read-only tools; allow: let the agent write and run commands")
-    serve.add_argument("--cors-origin", action="append", dest="cors_origins",
-                       help="allowed browser origin (repeatable; default: any)")
+    serve.add_argument(
+        "--mode",
+        choices=("allow", "deny"),
+        default="deny",
+        help="deny: read-only tools; allow: let the agent write and run commands",
+    )
+    serve.add_argument(
+        "--cors-origin", action="append", dest="cors_origins", help="allowed browser origin (repeatable; default: any)"
+    )
 
-    initp = sub.add_parser("init-provider",
-                           help="interactively add a provider to providers.yaml")
-    initp.add_argument("--config", metavar="PATH", default=None,
-                       help="target file (default: the harness config location)")
+    initp = sub.add_parser("init-provider", help="interactively add a provider to providers.yaml")
+    initp.add_argument(
+        "--config", metavar="PATH", default=None, help="target file (default: the harness config location)"
+    )
     initp.add_argument("--name", default=None, help="provider alias (default: prompted)")
     initp.add_argument("--base-url", default=None, help="API endpoint (default: prompted)")
     initp.add_argument("--model", default=None, help="default model (default: prompted)")
-    initp.add_argument("--models", default=None, metavar="ID1,ID2,...",
-                       help="curated model list (mutually exclusive with --model)")
+    initp.add_argument(
+        "--models", default=None, metavar="ID1,ID2,...", help="curated model list (mutually exclusive with --model)"
+    )
     initp.add_argument("--kind", default=None, help="wire protocol (default: openai)")
     initp.add_argument("--api-key", default=None, help="store this key in the file")
     return parser
@@ -441,8 +487,7 @@ def resolve_workspace(raw: str) -> Path:
 
 
 def install_hint(provider: str) -> str:
-    return ("uv pip install langchain-openai" if provider != "ollama"
-            else "uv pip install langchain-ollama")
+    return "uv pip install langchain-openai" if provider != "ollama" else "uv pip install langchain-ollama"
 
 
 def print_stats(agent: Harness) -> None:
@@ -461,41 +506,58 @@ def print_stats(agent: Harness) -> None:
     console.print(table)
 
 
-def make_agent(args: argparse.Namespace, workspace: Path, prov: Provider,
-               stream: bool = True) -> Harness:
+def make_agent(args: argparse.Namespace, workspace: Path, prov: Provider, stream: bool = True) -> Harness:
     try:
         return Harness(
-            model=prov.model, workspace=workspace, base_url=prov.endpoint,
-            max_steps=args.max_steps, retry_limit=args.retry_limit,
-            mode=args.mode, temperature=prov.temperature,
-            num_ctx=prov.num_ctx, provider=prov.name, api_key=prov.api_key,
-            show_results=args.show_results, stream=stream,
-            subagents=args.subagents, models=prov.models,
+            model=prov.model,
+            workspace=workspace,
+            base_url=prov.endpoint,
+            max_steps=args.max_steps,
+            retry_limit=args.retry_limit,
+            mode=args.mode,
+            temperature=prov.temperature,
+            num_ctx=prov.num_ctx,
+            provider=prov.name,
+            api_key=prov.api_key,
+            show_results=args.show_results,
+            stream=stream,
+            subagents=args.subagents,
+            models=prov.models,
         )
     except ImportError:
         console.print(f"[red]missing dependency:[/red] {install_hint(prov.name)}")
         sys.exit(1)
 
 
-def startup_panel(prov: Provider, base_url: str, workspace: Path,
-                  mode: str, tools: int, subagents: bool,
-                  key_set: bool, cfg_path: Path | None,
-                  stream: bool = True) -> None:
+def startup_panel(
+    prov: Provider,
+    base_url: str,
+    workspace: Path,
+    mode: str,
+    tools: int,
+    subagents: bool,
+    key_set: bool,
+    cfg_path: Path | None,
+    stream: bool = True,
+) -> None:
     choices = ""
     if len(prov.models) > 1:
         shown = ", ".join(prov.models[:4])
         more = f" … (+{len(prov.models) - 4})" if len(prov.models) > 4 else ""
         choices = f"\nmodels [bold]{shown}{more}[/bold]  (switch with /model)"
-    console.print(Panel.fit(
-        f"[bold]{provider_label(prov)}[/bold] · model [bold]{prov.model}[/bold] @ {base_url}\n"
-        f"context [bold]{prov.num_ctx:,}[/bold] · workspace [bold]{workspace}[/bold]\n"
-        f"mode [bold]{mode}[/bold] · {tools} tools"
-        f"{'  ·  sub-agents [bold]on[/bold]' if subagents else ''}"
-        f"{'  ·  config [dim]' + str(cfg_path) + '[/dim]' if cfg_path else ''}"
-        f"{'  ·  [yellow]no api key[/yellow]' if prov.name != 'ollama' and not key_set else ''}"
-        f"{choices}",
-        title="ollama-harness", border_style="green",
-    ))
+    console.print(
+        Panel.fit(
+            f"[bold]{provider_label(prov)}[/bold] · model [bold]{prov.model}[/bold] @ {base_url}\n"
+            f"context [bold]{prov.num_ctx:,}[/bold] · workspace [bold]{workspace}[/bold]\n"
+            f"mode [bold]{mode}[/bold] · {tools} tools"
+            f"{'  ·  sub-agents [bold]on[/bold]' if subagents else ''}"
+            f"{'  ·  config [dim]' + str(cfg_path) + '[/dim]' if cfg_path else ''}"
+            f"{'  ·  [yellow]no api key[/yellow]' if prov.name != 'ollama' and not key_set else ''}"
+            f"{choices}",
+            title="ollama-harness",
+            border_style="green",
+        )
+    )
 
 
 def run_chat(args: argparse.Namespace) -> None:
@@ -506,9 +568,17 @@ def run_chat(args: argparse.Namespace) -> None:
     stream = not args.no_stream
     agent = make_agent(args, workspace, prov, stream=stream)
 
-    startup_panel(prov, base_url, workspace, args.mode,
-                  len(agent.tools), agent.subagents,
-                  prov.api_key is not None, cfg_path, stream)
+    startup_panel(
+        prov,
+        base_url,
+        workspace,
+        args.mode,
+        len(agent.tools),
+        agent.subagents,
+        prov.api_key is not None,
+        cfg_path,
+        stream,
+    )
 
     if args.file:
         task = read_prompt_file(args.file)
@@ -519,16 +589,19 @@ def run_chat(args: argparse.Namespace) -> None:
         agent.run(" ".join(args.query))
         return
 
-    console.print('[dim]commands · ' + FENCE + ' opens a multi-line block · '
-                  '/file <path> · /allow /ask /deny · /subagents · '
-                  '/stats · /reset · /help · /quit[/dim]')
+    console.print(
+        "[dim]commands · " + FENCE + " opens a multi-line block · "
+        "/file <path> · /allow /ask /deny · /subagents · "
+        "/stats · /reset · /help · /quit[/dim]"
+    )
     while True:
         try:
             fill = (agent.context_used / agent.num_ctx * 100) if agent.num_ctx else 0
             gauge = f"[dim] {fill:.0f}%[/dim]" if agent.context_used else ""
             line = console.input(
                 f"\n[bold magenta]{agent.model}[/bold magenta]"
-                f"[dim] {agent.mode}[/dim]{gauge}[bold magenta]> [/bold magenta]").strip()
+                f"[dim] {agent.mode}[/dim]{gauge}[bold magenta]> [/bold magenta]"
+            ).strip()
         except (EOFError, KeyboardInterrupt):
             break
         if not line:
@@ -552,11 +625,9 @@ def run_chat(args: argparse.Namespace) -> None:
                 continue
             if cmd == "models":
                 if agent.models:
-                    console.print("[dim]available models:[/dim] "
-                                  + ", ".join(agent.models))
+                    console.print("[dim]available models:[/dim] " + ", ".join(agent.models))
                 else:
-                    console.print("[dim]this provider lists no curated models — "
-                                  "--model accepts any id[/dim]")
+                    console.print("[dim]this provider lists no curated models — --model accepts any id[/dim]")
                 continue
             if cmd.startswith("model ") and cmd.strip() != "model":
                 name = cmd.split(None, 1)[1].strip().strip('"').strip("'")
@@ -571,15 +642,16 @@ def run_chat(args: argparse.Namespace) -> None:
                 continue
             if cmd == "help":
                 console.print(
-                    '[dim]  ' + FENCE + '  start a multi-line block\n'
-                    '  /file <path>  run a task from a file\n'
-                    '  /allow /ask /deny  switch permission mode\n'
-                    '  /subagents  toggle the spawn_agent tool\n'
-                    '  /models  list this provider\'s curated models\n'
-                    '  /model <id>  switch model mid-session\n'
-                    '  /stats  session context, steps, tokens\n'
-                    '  /reset  clear conversation history\n'
-                    '  /quit (or q)  exit[/dim]')
+                    "[dim]  " + FENCE + "  start a multi-line block\n"
+                    "  /file <path>  run a task from a file\n"
+                    "  /allow /ask /deny  switch permission mode\n"
+                    "  /subagents  toggle the spawn_agent tool\n"
+                    "  /models  list this provider's curated models\n"
+                    "  /model <id>  switch model mid-session\n"
+                    "  /stats  session context, steps, tokens\n"
+                    "  /reset  clear conversation history\n"
+                    "  /quit (or q)  exit[/dim]"
+                )
                 continue
             if cmd == "reset":
                 agent.messages = agent.messages[:1]
@@ -599,7 +671,7 @@ def run_serve(args: argparse.Namespace) -> None:
     base_url = normalize_base_url(prov.endpoint)
     prov.base_url = base_url
     auth_key = args.api_key or pick_env("HARNESS_API_KEY")  # bearer auth for /v1
-    model_key = args.api_key or prov.api_key               # key the model call uses
+    model_key = args.api_key or prov.api_key  # key the model call uses
     try:
         import uvicorn
 
@@ -608,26 +680,39 @@ def run_serve(args: argparse.Namespace) -> None:
         console.print("[red]missing dependency:[/red] uv pip install fastapi uvicorn")
         sys.exit(1)
 
-    app = create_app(ServerConfig(
-        model=prov.model, base_url=base_url, workspace=workspace, mode=args.mode,
-        num_ctx=prov.num_ctx, max_steps=args.max_steps, retry_limit=args.retry_limit,
-        provider=prov.name, api_key=auth_key, model_api_key=model_key,
-        cors_origins=args.cors_origins or ["*"], models=prov.models,
-    ))
+    app = create_app(
+        ServerConfig(
+            model=prov.model,
+            base_url=base_url,
+            workspace=workspace,
+            mode=args.mode,
+            num_ctx=prov.num_ctx,
+            max_steps=args.max_steps,
+            retry_limit=args.retry_limit,
+            provider=prov.name,
+            api_key=auth_key,
+            model_api_key=model_key,
+            cors_origins=args.cors_origins or ["*"],
+            models=prov.models,
+        )
+    )
 
     keyed = prov.api_key is not None or auth_key is not None
     exposure = "localhost only" if args.host in ("127.0.0.1", "localhost") else "[bold red]all interfaces[/bold red]"
-    console.print(Panel.fit(
-        f"[bold]http://{args.host}:{args.port}/v1[/bold]  ({exposure})\n"
-        f"[bold]{provider_label(prov)}[/bold] · model [bold]{prov.model}[/bold] @ {base_url}\n"
-        f"workspace [bold]{workspace}[/bold]\n"
-        f"mode [bold]{args.mode}[/bold]"
-        f"{'' if args.mode == 'deny' else '  [yellow](the agent can write files and run commands)[/yellow]'}\n"
-        f"auth [bold]{'bearer key' if auth_key else 'none'}[/bold]"
-        f"{'  ·  [yellow]no model key[/yellow]' if prov.name != 'ollama' and not keyed else ''}"
-        f"{'  ·  config [dim]' + str(cfg_path) + '[/dim]' if cfg_path else ''}",
-        title="ollama-harness serve", border_style="green",
-    ))
+    console.print(
+        Panel.fit(
+            f"[bold]http://{args.host}:{args.port}/v1[/bold]  ({exposure})\n"
+            f"[bold]{provider_label(prov)}[/bold] · model [bold]{prov.model}[/bold] @ {base_url}\n"
+            f"workspace [bold]{workspace}[/bold]\n"
+            f"mode [bold]{args.mode}[/bold]"
+            f"{'' if args.mode == 'deny' else '  [yellow](the agent can write files and run commands)[/yellow]'}\n"
+            f"auth [bold]{'bearer key' if auth_key else 'none'}[/bold]"
+            f"{'  ·  [yellow]no model key[/yellow]' if prov.name != 'ollama' and not keyed else ''}"
+            f"{'  ·  config [dim]' + str(cfg_path) + '[/dim]' if cfg_path else ''}",
+            title="ollama-harness serve",
+            border_style="green",
+        )
+    )
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 
@@ -637,7 +722,7 @@ def main(argv: list[str] | None = None) -> None:
     load_dotenv(Path(__file__).resolve().parent / ".env")
     argv = list(sys.argv[1:] if argv is None else argv)
     if not argv or argv[0] not in COMMANDS and argv[0] not in ("-h", "--help", "--version"):
-        argv.insert(0, "chat")   # bare invocation, flags, or a query all mean chat
+        argv.insert(0, "chat")  # bare invocation, flags, or a query all mean chat
     args = build_parser().parse_args(argv)
     if args.add is not None:
         run_add_model(args)

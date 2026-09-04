@@ -37,27 +37,49 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterator, Optional, Type
+from typing import Any
 
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, Field, model_validator
 
-MAX_OUTPUT = 20_000        # cap on a single tool's returned text
-MAX_READ_LINES = 300       # lines read_file returns when given no explicit range
-MAX_WHOLE_READ = 4_000_000 # read_file refuses whole-file reads above this many bytes
-MAX_TRACE_LINES = 1_500    # debug_trace caps the per-line listing at this many lines
-MAX_TRACE_FRAMES = 12      # post-mortem dump keeps at most this many stack frames
-MAX_PM_VALUE = 500         # a single local/exception value is truncated to this
+from workspace.policy import InMemoryJournal
+
+MAX_OUTPUT = 20_000  # cap on a single tool's returned text
+MAX_READ_LINES = 300  # lines read_file returns when given no explicit range
+MAX_WHOLE_READ = 4_000_000  # read_file refuses whole-file reads above this many bytes
+MAX_TRACE_LINES = 1_500  # debug_trace caps the per-line listing at this many lines
+MAX_TRACE_FRAMES = 12  # post-mortem dump keeps at most this many stack frames
+MAX_PM_VALUE = 500  # a single local/exception value is truncated to this
 IGNORED_DIRS = {
-    ".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv",
-    ".mypy_cache", ".pytest_cache", ".ruff_cache", "dist", "build", ".idea",
+    ".git",
+    ".hg",
+    ".svn",
+    "node_modules",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    "dist",
+    "build",
+    ".idea",
 }
 # tools that mutate the workspace or the machine; gated by the harness
-DESTRUCTIVE = {"write_file", "apply_patch", "run_command", "run_tests",
-               "git_restore", "install_dependency", "check", "debug_trace",
-               "rerun_last"}
+DESTRUCTIVE = {
+    "write_file",
+    "apply_patch",
+    "run_command",
+    "run_tests",
+    "git_restore",
+    "install_dependency",
+    "check",
+    "debug_trace",
+    "rerun_last",
+}
 
 # functions mutate ONLY the listed paths: snapshot/diff/restore/journal can
 # compute modifications cheaply without ever running a command or reading files
@@ -83,8 +105,9 @@ def describe_environment(workspace: Path) -> str:
         f"- OS: {platform.platform()} ({platform.system()})",
         f"- run_command runs through: {shell}{shell_note}",
         f"- Shell syntax: {'cmd.exe — no ls, grep, cat, /tmp, or POSIX quoting' if windows else 'POSIX sh'}",
-        f"- Python: {sys.executable} ({platform.python_version()}); "
-        "invoke it as `python -m pytest`, never bare `pytest`",
+        f"- Python: {sys.executable} ({platform.python_version()}) is the harness runtime; "
+        f"the project venv is {find_project_python(workspace)} — run the project's code "
+        "(tests, scripts) with it, e.g. `uv run python -m pytest`, never bare `pytest`",
         f"- Temp directory: {tempfile.gettempdir()}" + (" — /tmp does not exist" if windows else ""),
         f"- Path separator: {os.sep!r}; tool arguments accept forward slashes and "
         "must stay relative to the workspace root",
@@ -109,13 +132,30 @@ def short_repr(v: Any) -> str:
     return s if len(s) <= MAX_PM_VALUE else s[:MAX_PM_VALUE] + "…"
 
 
+def find_project_python(workspace: Path) -> str:
+    """The project's own interpreter, not the harness's.
+
+    The harness runs in its own environment (``sys.executable``), which may
+    lack the project's dependencies. Tools that execute the project's code
+    (tests, tracing, installs) must use the project venv so those
+    dependencies are visible. Falls back to the harness interpreter when no
+    venv is present.
+    """
+    for venv in (".venv", "venv"):
+        for exe in ("Scripts/python.exe", "bin/python"):
+            p = workspace / venv / exe
+            if p.is_file():
+                return str(p)
+    return sys.executable
+
+
 def run_proc(cmd: list[str] | str, cwd: Path, timeout: int) -> str:
     kwargs: dict[str, Any] = dict(
         shell=isinstance(cmd, str),
         cwd=str(cwd),
         capture_output=True,
         text=True,
-        encoding="utf-8",      # stable decoding regardless of console code page
+        encoding="utf-8",  # stable decoding regardless of console code page
         errors="replace",
         timeout=timeout,
     )
@@ -145,8 +185,11 @@ class ToolArgs(BaseModel):
         if not isinstance(data, dict):
             return data
         return {
-            key: (value[0] if isinstance(value, list) and len(value) == 1
-                  and isinstance(value[0], (str, int, float, bool)) else value)
+            key: (
+                value[0]
+                if isinstance(value, list) and len(value) == 1 and isinstance(value[0], (str, int, float, bool))
+                else value
+            )
             for key, value in data.items()
         }
 
@@ -155,8 +198,9 @@ class WorkspaceTool(BaseTool):
     """Base: declares workspace_root as a real pydantic field and sandboxes paths."""
 
     workspace_root: Path = Field(default_factory=Path.cwd)
+    journal: InMemoryJournal | None = None
 
-    def resolve(self, path: Optional[str]) -> Path:
+    def resolve(self, path: str | None) -> Path:
         root = self.workspace_root.resolve()
         target = (root / (path or ".")).resolve()
         if target != root and root not in target.parents:
@@ -168,6 +212,10 @@ class WorkspaceTool(BaseTool):
             return p.resolve().relative_to(self.workspace_root.resolve()).as_posix() or "."
         except ValueError:
             return str(p)
+
+    def project_python(self) -> str:
+        """The project's own interpreter (see :func:`find_project_python`)."""
+        return find_project_python(self.workspace_root)
 
     def walk(self, root: Path) -> Iterator[Path]:
         if root.is_file():
@@ -198,13 +246,13 @@ class WorkspaceTool(BaseTool):
                 continue
             rel = self.rel(f)
             if rel.startswith(".harness/"):
-                continue   # never snapshot our own bookkeeping
+                continue  # never snapshot our own bookkeeping
             try:
                 data = f.read_bytes()
             except OSError:
                 continue
             h = hashlib.sha256(data).hexdigest()[:16]
-            (blobs / h).write_bytes(data)          # store content once (deduped by hash)
+            (blobs / h).write_bytes(data)  # store content once (deduped by hash)
             index[rel] = {"hash": h, "size": len(data)}
         (snap / "index.json").write_text(json.dumps(index), encoding="utf-8")
 
@@ -216,7 +264,7 @@ class WorkspaceTool(BaseTool):
         self._index_snapshot(snap)
         return snap.name
 
-    def _load_saved(self, slot: str) -> Optional[dict[str, dict[str, Any]]]:
+    def _load_saved(self, slot: str) -> dict[str, dict[str, Any]] | None:
         idx = self._snapshot_path() / "snapshots" / slot / "index.json"
         if not idx.exists():
             return None
@@ -312,17 +360,16 @@ class WorkspaceTool(BaseTool):
 
 class ReadFileArgs(ToolArgs):
     path: str = Field(description="File path relative to the workspace root.")
-    start_line: Optional[int] = Field(None, description="1-based first line to return.")
-    end_line: Optional[int] = Field(None, description="1-based last line to return (inclusive).")
+    start_line: int | None = Field(None, description="1-based first line to return.")
+    end_line: int | None = Field(None, description="1-based last line to return (inclusive).")
 
 
 class ReadFileTool(WorkspaceTool):
     name: str = "read_file"
     description: str = "Read a text file from the workspace. Returns numbered lines."
-    args_schema: Type[BaseModel] = ReadFileArgs
+    args_schema: type[BaseModel] = ReadFileArgs
 
-    def _run(self, path: str, start_line: Optional[int] = None,
-             end_line: Optional[int] = None) -> str:
+    def _run(self, path: str, start_line: int | None = None, end_line: int | None = None) -> str:
         f = self.resolve(path)
         if not f.is_file():
             return f"Error: not a file: {path}"
@@ -332,18 +379,21 @@ class ReadFileTool(WorkspaceTool):
                 if start_line is None and end_line is None:
                     # whole-file read, but never blow up the context on a giant file
                     if size > MAX_WHOLE_READ:
-                        return (f"{self.rel(f)}: {size:,} bytes — too large to read "
-                                "whole. Pass start_line/end_line for a range.")
+                        return (
+                            f"{self.rel(f)}: {size:,} bytes — too large to read "
+                            "whole. Pass start_line/end_line for a range."
+                        )
                     lines = fh.readlines()
                     total = len(lines)
                     end = min(total, MAX_READ_LINES)
                     note = ""
                     if total > MAX_READ_LINES:
                         end = MAX_READ_LINES
-                        note = (f"\n[showing first {MAX_READ_LINES} of {total} lines; "
-                                "re-read with start_line/end_line for the rest]")
-                    body = "\n".join(
-                        f"{i:>5}  {lines[i - 1].rstrip()}" for i in range(1, end + 1))
+                        note = (
+                            f"\n[showing first {MAX_READ_LINES} of {total} lines; "
+                            "re-read with start_line/end_line for the rest]"
+                        )
+                    body = "\n".join(f"{i:>5}  {lines[i - 1].rstrip()}" for i in range(1, end + 1))
                     return truncate(f"{self.rel(f)} (lines 1-{end} of {total})\n{body}{note}")
 
                 # explicit range: stream only the requested lines
@@ -377,7 +427,7 @@ class ListDirArgs(ToolArgs):
 class ListDirectoryTool(WorkspaceTool):
     name: str = "list_directory"
     description: str = "List files and directories in the workspace."
-    args_schema: Type[BaseModel] = ListDirArgs
+    args_schema: type[BaseModel] = ListDirArgs
 
     def _run(self, path: str = ".", recursive: bool = False) -> str:
         d = self.resolve(path)
@@ -397,18 +447,17 @@ class ListDirectoryTool(WorkspaceTool):
 
 class SearchArgs(ToolArgs):
     query: str = Field(description="Regular expression to search for.")
-    path: Optional[str] = Field(None, description="Directory or file to search under.")
-    file_pattern: Optional[str] = Field(None, description="Glob filter on file names, e.g. '*.py'.")
+    path: str | None = Field(None, description="Directory or file to search under.")
+    file_pattern: str | None = Field(None, description="Glob filter on file names, e.g. '*.py'.")
     max_results: int = Field(50, description="Maximum matching lines to return.")
 
 
 class SearchFilesTool(WorkspaceTool):
     name: str = "search_files"
     description: str = "Search workspace files for a regex; returns path:line and the matching line."
-    args_schema: Type[BaseModel] = SearchArgs
+    args_schema: type[BaseModel] = SearchArgs
 
-    def _run(self, query: str, path: Optional[str] = None,
-             file_pattern: Optional[str] = None, max_results: int = 50) -> str:
+    def _run(self, query: str, path: str | None = None, file_pattern: str | None = None, max_results: int = 50) -> str:
         try:
             pattern = re.compile(query)
         except re.error as e:
@@ -434,22 +483,19 @@ class SearchFilesTool(WorkspaceTool):
 
 class FindArgs(ToolArgs):
     pattern: str = Field(description="Glob pattern, e.g. '**/*.py' or 'test_*.py'.")
-    path: Optional[str] = Field(None, description="Directory to search under.")
+    path: str | None = Field(None, description="Directory to search under.")
 
 
 class FindFilesTool(WorkspaceTool):
     name: str = "find_files"
     description: str = "Find files matching a glob pattern."
-    args_schema: Type[BaseModel] = FindArgs
+    args_schema: type[BaseModel] = FindArgs
 
-    def _run(self, pattern: str, path: Optional[str] = None) -> str:
+    def _run(self, pattern: str, path: str | None = None) -> str:
         root = self.resolve(path)
         if not root.is_dir():
             return f"Error: not a directory: {path}"
-        found = [
-            self.rel(p) for p in sorted(root.rglob(pattern))
-            if p.is_file() and not (set(p.parts) & IGNORED_DIRS)
-        ]
+        found = [self.rel(p) for p in sorted(root.rglob(pattern)) if p.is_file() and not (set(p.parts) & IGNORED_DIRS)]
         return truncate("\n".join(found)) if found else "No files matched."
 
 
@@ -461,17 +507,21 @@ class WriteArgs(ToolArgs):
 class WriteFileTool(WorkspaceTool):
     name: str = "write_file"
     description: str = "Write complete contents to a file, creating parent directories as needed."
-    args_schema: Type[BaseModel] = WriteArgs
+    args_schema: type[BaseModel] = WriteArgs
 
     def _run(self, path: str, content: str) -> str:
         f = self.resolve(path)
         data = content.encode("utf-8")
         try:
-            self.snapshot("write_file")
+            self._journal_write(f)
             self._write_bytes(f, data)
         except OSError as e:
             return f"Error writing {path}: {e}"
         return f"Wrote {len(data)} bytes ({content.count(chr(10)) + 1} lines) to {self.rel(f)}"
+
+    def _journal_write(self, f: Path) -> None:
+        if self.journal is not None and f.is_file():
+            self.journal.write(self.rel(f), f.read_bytes())
 
 
 class PatchArgs(ToolArgs):
@@ -485,13 +535,13 @@ class ApplyPatchTool(WorkspaceTool):
         "Apply a unified diff to workspace files. Uses a built-in pure-Python "
         "engine, so it works even without git. Returns per-hunk results."
     )
-    args_schema: Type[BaseModel] = PatchArgs
+    args_schema: type[BaseModel] = PatchArgs
 
     @staticmethod
     def _parse_patch(patch: str) -> list[dict[str, Any]]:
         """Split a unified diff into per-file {old, new, hunks:[(start, old, new)]}."""
         files: list[dict[str, Any]] = []
-        fcur: Optional[dict[str, Any]] = None
+        fcur: dict[str, Any] | None = None
         hunks: list[tuple[int, list[str], list[str]]] = []
         for idx, line in enumerate(patch.splitlines()):
             if line.startswith("+++ "):
@@ -518,7 +568,7 @@ class ApplyPatchTool(WorkspaceTool):
             old_lines: list[str] = []
             new_lines: list[str] = []
             # accumulate following body lines until the next diff header
-            body = patch.splitlines()[idx + 1:]
+            body = patch.splitlines()[idx + 1 :]
             for bl in body:
                 if bl.startswith(("@@", "+++ ", "--- ")):
                     break
@@ -540,8 +590,9 @@ class ApplyPatchTool(WorkspaceTool):
         return files
 
     @staticmethod
-    def _apply_hunk(target: list[str], ostart: int, old_lines: list[str],
-                    new_lines: list[str], fuzz: int = 0) -> Optional[int]:
+    def _apply_hunk(
+        target: list[str], ostart: int, old_lines: list[str], new_lines: list[str], fuzz: int = 0
+    ) -> int | None:
         """Locate `old_lines` in `target` near 1-based `ostart` and replace it
         with `new_lines`. Returns the 1-based line where it applied, or None."""
         if not old_lines:
@@ -555,16 +606,16 @@ class ApplyPatchTool(WorkspaceTool):
         lo = max(0, ostart - 1 - fuzz)
         hi = min(window, ostart - 1 + fuzz + 1)
         for i in range(lo, hi):
-            if target[i:i + n] == old_lines:
-                target[i:i + n] = new_lines
+            if target[i : i + n] == old_lines:
+                target[i : i + n] = new_lines
                 return i + 1
         for i in range(lo - 1, -1, -1):
-            if target[i:i + n] == old_lines:
-                target[i:i + n] = new_lines
+            if target[i : i + n] == old_lines:
+                target[i : i + n] = new_lines
                 return i + 1
         for i in range(hi, window):
-            if target[i:i + n] == old_lines:
-                target[i:i + n] = new_lines
+            if target[i : i + n] == old_lines:
+                target[i : i + n] = new_lines
                 return i + 1
         return None
 
@@ -572,73 +623,79 @@ class ApplyPatchTool(WorkspaceTool):
         files = self._parse_patch(patch)
         if not files:
             return "Error: no parseable hunks in the patch. Use unified diff with a/ and b/ prefixes."
-        out: list[str] = []
-        total_hunks = 0
-        applied_hunks = 0
+        if not any(f["hunks"] for f in files):
+            return (
+                "Error: the patch has file headers but no hunks. Each change needs a "
+                "@@ -OLD,OLD_COUNT +NEW,NEW_COUNT @@ hunk header followed by the "
+                "-old / +new / context lines; a bare @@ or a missing header is not a hunk."
+            )
+
+        # Stage every hunk first; a patch is a transaction: either every hunk
+        # applies, or no file is modified.
+        staged: list[tuple[str, list[str]]] = []
         for fcur in files:
-            name = fcur["new"] or fcur["old"] or "(unknown)"
-            name = name.removeprefix("a/").removeprefix("b/")
-            fpath = self.resolve(name)
-            if not fpath.is_file():
-                out.append(f"cannot apply {name}: file does not exist")
-                continue
+            name = (fcur["new"] or fcur["old"] or "(unknown)").removeprefix("a/").removeprefix("b/")
             try:
+                fpath = self.resolve(name)
                 text = fpath.read_text(encoding="utf-8", errors="replace")
-            except OSError as e:
-                out.append(f"cannot read {name}: {e}")
-                continue
+            except (OSError, ValueError) as e:
+                return f"Error preparing {name}: {e}"
             target = text.splitlines()
-            total_hunks += len(fcur["hunks"])
-            ok = 0
             for ostart, old_lines, new_lines in fcur["hunks"]:
-                pos = self._apply_hunk(target, ostart, old_lines, new_lines, fuzz)
-                if pos is not None:
-                    ok += 1
-                    applied_hunks += 1
-            if ok == len(fcur["hunks"]):
-                try:
-                    fpath.write_text("\n".join(target), encoding="utf-8", newline="\n")
-                except OSError as e:
-                    out.append(f"error writing {name}: {e}")
-                    continue
-                out.append(f"applied {ok}/{len(fcur['hunks'])} hunk(s) to {name}")
-            else:
-                out.append(f"FAILED {ok}/{len(fcur['hunks'])} hunk(s) on {name}")
+                if self._apply_hunk(target, ostart, old_lines, new_lines, fuzz) is None:
+                    return (
+                        f"Error: cannot apply hunk to {name} — no files were changed. "
+                        "Fix the patch against the current file contents and retry."
+                    )
+            staged.append((name, target))
+
+        out: list[str] = []
+        total_hunks = sum(len(fcur["hunks"]) for fcur in files)
+        applied_hunks = 0
+        for fcur, (name, target) in zip(files, staged, strict=True):
+            ok = len(fcur["hunks"])
+            try:
+                fpath = self.resolve(name)
+                fpath.write_text("\n".join(target), encoding="utf-8", newline="\n")
+            except OSError as e:
+                out.append(f"error writing {name}: {e}")
+                continue
+            applied_hunks += ok
+            out.append(f"applied {ok}/{ok} hunk(s) to {name}")
         summary = f"Patch: applied {applied_hunks}/{total_hunks} hunk(s)" if total_hunks else "Patch: no hunks"
         return summary + "\n" + "\n".join(out) if out else summary
 
 
 class CommandArgs(ToolArgs):
     command: str = Field(description="Shell command to execute.")
-    cwd: Optional[str] = Field(None, description="Directory relative to the workspace root.")
+    cwd: str | None = Field(None, description="Directory relative to the workspace root.")
     timeout: int = Field(60, description="Timeout in seconds.")
 
 
 class RunCommandTool(WorkspaceTool):
     name: str = "run_command"
     description: str = "Execute a shell command in the workspace; returns exit code, stdout, stderr."
-    args_schema: Type[BaseModel] = CommandArgs
+    args_schema: type[BaseModel] = CommandArgs
 
-    def _run(self, command: str, cwd: Optional[str] = None, timeout: int = 60) -> str:
+    def _run(self, command: str, cwd: str | None = None, timeout: int = 60) -> str:
         global _last_command
         _last_command[:] = [command]
         return run_proc(command, self.resolve(cwd), timeout)
 
 
 class TestArgs(ToolArgs):
-    test_path: Optional[str] = Field(None, description="File or directory of tests to run.")
-    filter: Optional[str] = Field(None, description="pytest -k expression.")
+    test_path: str | None = Field(None, description="File or directory of tests to run.")
+    filter: str | None = Field(None, description="pytest -k expression.")
     timeout: int = Field(300, description="Timeout in seconds.")
 
 
 class RunTestsTool(WorkspaceTool):
     name: str = "run_tests"
     description: str = "Run the pytest suite and return the results."
-    args_schema: Type[BaseModel] = TestArgs
+    args_schema: type[BaseModel] = TestArgs
 
-    def _run(self, test_path: Optional[str] = None, filter: Optional[str] = None,
-             timeout: int = 300) -> str:
-        cmd = [sys.executable, "-m", "pytest", "-q"]
+    def _run(self, test_path: str | None = None, filter: str | None = None, timeout: int = 300) -> str:
+        cmd = [self.project_python(), "-m", "pytest", "-q"]
         if test_path:
             cmd.append(str(self.resolve(test_path)))
         if filter:
@@ -647,7 +704,14 @@ class RunTestsTool(WorkspaceTool):
 
     def _summarize(self, raw: str) -> str:
         """Turn pytest's raw output into a stable, complete summary the model
-        can act on: pass/fail counts plus every failure's node id."""
+        can act on: pass/fail counts plus every failure's node id.
+
+        If pytest never produced a result line (collection error, missing
+        interpreter, timeout, ...) the raw output is returned verbatim so the
+        real problem is visible instead of a misleading all-zero summary.
+        """
+        if not re.search(r"\d+\s+(?:passed|failed|error|skipped|deselected)", raw):
+            return truncate("pytest did not report a result; raw output:\n" + raw)
         fails: list[str] = []
         for line in raw.splitlines():
             f = line.strip()
@@ -672,16 +736,16 @@ class RunTestsTool(WorkspaceTool):
 
 
 class GitDiffArgs(ToolArgs):
-    path: Optional[str] = Field(None, description="Limit the diff to this path.")
+    path: str | None = Field(None, description="Limit the diff to this path.")
     staged: bool = Field(False, description="Show staged changes instead of unstaged.")
 
 
 class GitDiffTool(WorkspaceTool):
     name: str = "git_diff"
     description: str = "Show the current git diff."
-    args_schema: Type[BaseModel] = GitDiffArgs
+    args_schema: type[BaseModel] = GitDiffArgs
 
-    def _run(self, path: Optional[str] = None, staged: bool = False) -> str:
+    def _run(self, path: str | None = None, staged: bool = False) -> str:
         cmd = ["git", "--no-pager", "diff"] + (["--cached"] if staged else [])
         if path:
             cmd += ["--", str(self.resolve(path))]
@@ -695,7 +759,7 @@ class NoArgs(ToolArgs):
 class GitStatusTool(WorkspaceTool):
     name: str = "git_status"
     description: str = "Show the git working tree status."
-    args_schema: Type[BaseModel] = NoArgs
+    args_schema: type[BaseModel] = NoArgs
 
     def _run(self) -> str:
         return run_proc(["git", "status", "--short", "--branch"], self.workspace_root, 30)
@@ -703,15 +767,15 @@ class GitStatusTool(WorkspaceTool):
 
 class GitLogArgs(ToolArgs):
     limit: int = Field(10, description="Number of commits to show.")
-    path: Optional[str] = Field(None, description="Limit history to this path.")
+    path: str | None = Field(None, description="Limit history to this path.")
 
 
 class GitLogTool(WorkspaceTool):
     name: str = "git_log"
     description: str = "Show recent git commit history."
-    args_schema: Type[BaseModel] = GitLogArgs
+    args_schema: type[BaseModel] = GitLogArgs
 
-    def _run(self, limit: int = 10, path: Optional[str] = None) -> str:
+    def _run(self, limit: int = 10, path: str | None = None) -> str:
         cmd = ["git", "--no-pager", "log", f"--max-count={limit}", "--oneline"]
         if path:
             cmd += ["--", str(self.resolve(path))]
@@ -725,7 +789,7 @@ class GitRestoreArgs(ToolArgs):
 class GitRestoreTool(WorkspaceTool):
     name: str = "git_restore"
     description: str = "Discard local changes to a file by restoring it from HEAD."
-    args_schema: Type[BaseModel] = GitRestoreArgs
+    args_schema: type[BaseModel] = GitRestoreArgs
 
     def _run(self, path: str) -> str:
         target = self.resolve(path)
@@ -736,7 +800,7 @@ class GitRestoreTool(WorkspaceTool):
 class InspectEnvironmentTool(WorkspaceTool):
     name: str = "inspect_environment"
     description: str = "Report OS, Python, git and package-manager versions, and the workspace root."
-    args_schema: Type[BaseModel] = NoArgs
+    args_schema: type[BaseModel] = NoArgs
 
     def _run(self) -> str:
         def version(cmd: list[str]) -> str:
@@ -746,14 +810,16 @@ class InspectEnvironmentTool(WorkspaceTool):
             except (OSError, subprocess.TimeoutExpired, IndexError):
                 return "not found"
 
-        return "\n".join([
-            f"os: {platform.platform()}",
-            f"python: {sys.version.split()[0]} ({sys.executable})",
-            f"git: {version(['git', '--version'])}",
-            f"uv: {version(['uv', 'version'])}",
-            f"pytest: {version([sys.executable, '-m', 'pytest', '--version'])}",
-            f"workspace: {self.workspace_root.resolve()}",
-        ])
+        return "\n".join(
+            [
+                f"os: {platform.platform()}",
+                f"python: {sys.version.split()[0]} ({sys.executable})",
+                f"git: {version(['git', '--version'])}",
+                f"uv: {version(['uv', 'version'])}",
+                f"pytest: {version([sys.executable, '-m', 'pytest', '--version'])}",
+                f"workspace: {self.workspace_root.resolve()}",
+            ]
+        )
 
 
 class InstallArgs(ToolArgs):
@@ -763,13 +829,13 @@ class InstallArgs(ToolArgs):
 class InstallDependencyTool(WorkspaceTool):
     name: str = "install_dependency"
     description: str = "Install a Python package into the current environment (uv if available, else pip)."
-    args_schema: Type[BaseModel] = InstallArgs
+    args_schema: type[BaseModel] = InstallArgs
 
     def _run(self, package: str) -> str:
         if shutil.which("uv"):
             cmd = ["uv", "pip", "install", package]
         else:
-            cmd = [sys.executable, "-m", "pip", "install", package]
+            cmd = [self.project_python(), "-m", "pip", "install", package]
         return run_proc(cmd, self.workspace_root, 300)
 
 
@@ -780,7 +846,7 @@ class FileInfoArgs(ToolArgs):
 class FileInfoTool(WorkspaceTool):
     name: str = "file_info"
     description: str = "Return size, type and modification time for a file or directory."
-    args_schema: Type[BaseModel] = FileInfoArgs
+    args_schema: type[BaseModel] = FileInfoArgs
 
     def _run(self, path: str) -> str:
         p = self.resolve(path)
@@ -800,31 +866,33 @@ class SnapArgs(ToolArgs):
 
 class SnapshotTool(WorkspaceTool):
     name: str = "snapshot"
-    description: str = ("Record the current state of every workspace file so the "
-                       "agent can diff against or restore it later. Returns a slot id.")
-    args_schema: Type[BaseModel] = SnapArgs
+    description: str = (
+        "Record the current state of every workspace file so the "
+        "agent can diff against or restore it later. Returns a slot id."
+    )
+    args_schema: type[BaseModel] = SnapArgs
 
     def _run(self, label: str = "auto") -> str:
         return self.snapshot(label)
 
 
 class DiffArgs(ToolArgs):
-    revision: Optional[str] = Field(None, description="Snapshot slot id to diff against; default: latest.")
+    revision: str | None = Field(None, description="Snapshot slot id to diff against; default: latest.")
 
 
 class DiffTool(WorkspaceTool):
     name: str = "diff"
     description: str = "Show files changed since a snapshot (or since the last snapshot)."
-    args_schema: Type[BaseModel] = DiffArgs
+    args_schema: type[BaseModel] = DiffArgs
 
-    def _latest_slot(self) -> Optional[str]:
+    def _latest_slot(self) -> str | None:
         base = self._snapshot_path() / "snapshots"
         if not base.is_dir():
             return None
         slots = [d.name for d in base.iterdir() if d.is_dir()]
         return max(slots) if slots else None
 
-    def _run(self, revision: Optional[str] = None) -> str:
+    def _run(self, revision: str | None = None) -> str:
         slot = revision or self._latest_slot()
         if not slot:
             return "No snapshots yet. Use snapshot to record one."
@@ -839,23 +907,23 @@ class RestoreArgs(ToolArgs):
 class RestoreTool(WorkspaceTool):
     name: str = "restore"
     description: str = "Restore every workspace file to a previously recorded snapshot state."
-    args_schema: Type[BaseModel] = RestoreArgs
+    args_schema: type[BaseModel] = RestoreArgs
 
     def _run(self, revision: str) -> str:
         return self._apply_snapshot(revision)
 
 
 class CheckArgs(ToolArgs):
-    path: Optional[str] = Field(None, description="File or directory to check (default: whole workspace).")
+    path: str | None = Field(None, description="File or directory to check (default: whole workspace).")
     timeout: int = Field(60, description="Timeout in seconds.")
 
 
 class CheckTool(WorkspaceTool):
     name: str = "check"
     description: str = "Fast static checks: syntax-check .py files and run linters if present."
-    args_schema: Type[BaseModel] = CheckArgs
+    args_schema: type[BaseModel] = CheckArgs
 
-    def _run(self, path: Optional[str] = None, timeout: int = 60) -> str:
+    def _run(self, path: str | None = None, timeout: int = 60) -> str:
         root = self.resolve(path) if path else self.workspace_root
         files = [f for f in self.walk(root) if f.suffix == ".py"]
         if not files:
@@ -885,12 +953,12 @@ class DebugTraceArgs(ToolArgs):
 
 class DebugTraceTool(WorkspaceTool):
     name: str = "debug_trace"
-    description: str = ("Run a Python script under a line/call tracer and return a "
-                       "per-line account (lines executed, calls, or counts).")
-    args_schema: Type[BaseModel] = DebugTraceArgs
+    description: str = (
+        "Run a Python script under a line/call tracer and return a per-line account (lines executed, calls, or counts)."
+    )
+    args_schema: type[BaseModel] = DebugTraceArgs
 
-    def _run(self, script: str, args: str = "", trace_fn: str = "lines",
-             timeout: int = 120) -> str:
+    def _run(self, script: str, args: str = "", trace_fn: str = "lines", timeout: int = 120) -> str:
         f = self.resolve(script)
         if not f.is_file():
             return f"Error: not a file: {script}"
@@ -904,7 +972,7 @@ class DebugTraceTool(WorkspaceTool):
             flags = ["--count"]
         else:  # calls
             flags = ["--count", "--trace"]
-        cmd = [sys.executable, "-m", "trace"] + flags + [str(f)] + (args.split() if args else [])
+        cmd = [self.project_python(), "-m", "trace"] + flags + [str(f)] + (args.split() if args else [])
         return run_proc(cmd, self.workspace_root, timeout)
 
 
@@ -915,7 +983,7 @@ class RerunArgs(ToolArgs):
 class RerunLastTool(WorkspaceTool):
     name: str = "rerun_last"
     description: str = "Re-run the exact last run_command, with an optional timeout override."
-    args_schema: Type[BaseModel] = RerunArgs
+    args_schema: type[BaseModel] = RerunArgs
 
     def _run(self, timeout: int = 60) -> str:
         global _last_command
@@ -924,16 +992,33 @@ class RerunLastTool(WorkspaceTool):
         return run_proc(_last_command[0], self.workspace_root, timeout)
 
 
-_last_command: list[str] = []   # set by RunCommandTool; read by RerunLastTool
+_last_command: list[str] = []  # set by RunCommandTool; read by RerunLastTool
 
 
-def create_tools(workspace_root: Path) -> list[BaseTool]:
+def create_tools(workspace_root: Path, journal: InMemoryJournal | None = None) -> list[BaseTool]:
     kinds = [
-        ReadFileTool, ListDirectoryTool, SearchFilesTool, FindFilesTool,
-        WriteFileTool, ApplyPatchTool, RunCommandTool, RunTestsTool,
-        GitDiffTool, GitStatusTool, GitLogTool, GitRestoreTool,
-        InspectEnvironmentTool, InstallDependencyTool, FileInfoTool,
-        SnapshotTool, DiffTool, RestoreTool, CheckTool, DebugTraceTool,
+        ReadFileTool,
+        ListDirectoryTool,
+        SearchFilesTool,
+        FindFilesTool,
+        WriteFileTool,
+        ApplyPatchTool,
+        RunCommandTool,
+        RunTestsTool,
+        GitDiffTool,
+        GitStatusTool,
+        GitLogTool,
+        GitRestoreTool,
+        InspectEnvironmentTool,
+        InstallDependencyTool,
+        FileInfoTool,
+        SnapshotTool,
+        DiffTool,
+        RestoreTool,
+        CheckTool,
+        DebugTraceTool,
         RerunLastTool,
     ]
-    return [k(workspace_root=workspace_root) for k in kinds]
+    if journal is None:
+        return [k(workspace_root=workspace_root) for k in kinds]
+    return [k(workspace_root=workspace_root, journal=journal) for k in kinds]

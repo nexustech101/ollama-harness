@@ -8,6 +8,8 @@ wheels/
 .playwright
 .pytest_cache/
 .ruff_cache/
+.harness/
+.mypy_cache/
 
 # Virtual environments
 .venv
@@ -16,3 +18,5 @@ wheels/
 
 # Miscellaneous
 providers.yaml
+FRONTEND.md
+PLAN.md

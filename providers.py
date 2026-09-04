@@ -54,7 +54,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import yaml  # PyYAML (declared dependency; also shipped by langchain-core)
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -80,7 +80,7 @@ _API_KEY_ENVS = {
 }
 
 
-def api_key_from_env(provider: str) -> Optional[str]:
+def api_key_from_env(provider: str) -> str | None:
     """Best available API key for a provider: its own env var, then HARNESS_API_KEY."""
     for var in _API_KEY_ENVS.get(provider, ()) + ("HARNESS_API_KEY",):
         value = os.environ.get(var)
@@ -101,6 +101,7 @@ def _first(*values: Any) -> Any:
 # YAML config file
 # ---------------------------------------------------------------------------
 
+
 def default_config_path() -> Path:
     """Where the harness-level providers.yaml lives (created there if missing)."""
     if os.name == "nt" and os.environ.get("APPDATA"):
@@ -108,7 +109,7 @@ def default_config_path() -> Path:
     return Path.home() / ".config" / "harness" / "providers.yaml"
 
 
-def find_config(explicit: Optional[str] = None) -> Optional[Path]:
+def find_config(explicit: str | None = None) -> Path | None:
     """Locate the harness providers.yaml: --config, then $HARNESS_CONFIG,
     then the user-level harness config directory. The current directory is
     never searched — the config belongs to the harness, not to wherever you
@@ -140,28 +141,24 @@ def load_config(path: Path) -> dict[str, Any]:
     except yaml.YAMLError as e:
         raise ValueError(f"{path}: invalid YAML: {e}") from e
     if not isinstance(data, dict):
-        raise ValueError(f"{path}: expected a mapping of provider settings, "
-                         f"got {type(data).__name__}")
+        raise ValueError(f"{path}: expected a mapping of provider settings, got {type(data).__name__}")
     providers = data.get("providers") or {}
     if not isinstance(providers, dict):
         raise ValueError(f"{path}: 'providers' must be a mapping of name -> options")
     cleaned: dict[str, dict[str, Any]] = {}
     for name, opts in providers.items():
         if not isinstance(opts, dict):
-            raise ValueError(f"{path}: provider {name!r} must be a mapping "
-                             f"of options (got {type(opts).__name__})")
+            raise ValueError(f"{path}: provider {name!r} must be a mapping of options (got {type(opts).__name__})")
         models = opts.get("models")
         if models is not None:
-            if not isinstance(models, list) or not all(
-                    isinstance(m, str) and m.strip() for m in models):
-                raise ValueError(f"{path}: provider {name!r} 'models' must be "
-                                 f"a list of model ids (got {models!r})")
+            if not isinstance(models, list) or not all(isinstance(m, str) and m.strip() for m in models):
+                raise ValueError(f"{path}: provider {name!r} 'models' must be a list of model ids (got {models!r})")
             opts = {**opts, "models": [m.strip() for m in models]}
         cleaned[str(name)] = {str(k): v for k, v in opts.items()}
     return {"providers": cleaned}
 
 
-def available_providers(config: Optional[dict[str, Any]] = None) -> str:
+def available_providers(config: dict[str, Any] | None = None) -> str:
     """Human-readable name list for error messages."""
     names = list(PROVIDERS)
     if config:
@@ -169,7 +166,7 @@ def available_providers(config: Optional[dict[str, Any]] = None) -> str:
     return ", ".join(names)
 
 
-def provider_names(config: Optional[dict[str, Any]] = None) -> list[str]:
+def provider_names(config: dict[str, Any] | None = None) -> list[str]:
     """All known provider names: built-ins first, then config entries."""
     names = list(PROVIDERS)
     if config:
@@ -177,11 +174,15 @@ def provider_names(config: Optional[dict[str, Any]] = None) -> list[str]:
     return names
 
 
-def build_provider_entry(*, kind: Optional[str] = None, base_url: str,
-                         api_key: Optional[str] = None,
-                         default_model: Optional[str] = None,
-                         num_ctx: Optional[int] = None,
-                         models: Optional[list[str]] = None) -> dict[str, Any]:
+def build_provider_entry(
+    *,
+    kind: str | None = None,
+    base_url: str,
+    api_key: str | None = None,
+    default_model: str | None = None,
+    num_ctx: int | None = None,
+    models: list[str] | None = None,
+) -> dict[str, Any]:
     """Build a provider entry dict for the YAML config (None values dropped).
 
     ``kind`` may be omitted entirely — a name matching a built-in inherits that
@@ -210,18 +211,19 @@ def build_provider_entry(*, kind: Optional[str] = None, base_url: str,
 # Resolved provider
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class Provider:
     """Everything needed to build one chat model."""
 
-    name: str = "ollama"        # wire protocol family: one of PROVIDERS
+    name: str = "ollama"  # wire protocol family: one of PROVIDERS
     model: str = ""
-    base_url: Optional[str] = None
-    api_key: Optional[str] = None
+    base_url: str | None = None
+    api_key: str | None = None
     num_ctx: int = DEFAULT_NUM_CTX
     temperature: float = 0.0
     extra: dict[str, Any] = field(default_factory=dict)
-    label: str = ""             # config alias or display name, when name is a family
+    label: str = ""  # config alias or display name, when name is a family
     models: tuple[str, ...] = ()  # curated model ids from the config entry (may be empty)
 
     @property
@@ -252,14 +254,14 @@ class Provider:
 
 
 def resolve_provider(
-        name: Optional[str] = None,
-        *,
-        model: Optional[str] = None,
-        base_url: Optional[str] = None,
-        api_key: Optional[str] = None,
-        num_ctx: Optional[int] = None,
-        temperature: Optional[float] = None,
-        config: Optional[dict[str, Any]] = None,
+    name: str | None = None,
+    *,
+    model: str | None = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    num_ctx: int | None = None,
+    temperature: float | None = None,
+    config: dict[str, Any] | None = None,
 ) -> Provider:
     """Resolve one named provider into a concrete Provider.
 
@@ -273,8 +275,7 @@ def resolve_provider(
     wanted = _first(name) or "ollama"
     entry = entries.get(str(wanted))
     if entry is None and wanted not in PROVIDERS:
-        raise ValueError(
-            f"unknown provider {wanted!r}. Known providers: {available_providers(config)}")
+        raise ValueError(f"unknown provider {wanted!r}. Known providers: {available_providers(config)}")
 
     # Wire protocol family: built-in names keep their protocol; custom names
     # default to openai unless the entry sets `kind`.
@@ -283,7 +284,8 @@ def resolve_provider(
     if family not in PROVIDERS:
         raise ValueError(
             f"provider {wanted!r}: kind {family!r} is not a supported protocol "
-            f"({', '.join(PROVIDERS)}); set kind or use a built-in name")
+            f"({', '.join(PROVIDERS)}); set kind or use a built-in name"
+        )
 
     # Fall backs for the ollama-protocol family keep the legacy env names.
     legacy_model_env = os.environ.get("OLLAMA_MODEL") if family == "ollama" else None
@@ -295,22 +297,33 @@ def resolve_provider(
         raise ValueError(
             f"provider {wanted!r}: model {model!r} is not among its configured "
             f"models: {', '.join(spec_models)}. Pick one of those, or remove "
-            f"the models list from the config to allow any id.")
+            f"the models list from the config to allow any id."
+        )
 
     # The default model is the entry's `default:` field ('model:' is accepted
     # as a legacy alias); otherwise the first entry of `models:`.
     entry_default = (entry.get("default") or entry.get("model")) if entry else None
 
     # Precedence per field: flag > config entry > env var > built-in default.
-    resolved_model = _first(model, entry_default,
-                            spec_models[0] if spec_models else None,
-                            os.environ.get("HARNESS_MODEL"), legacy_model_env,
-                            DEFAULT_MODELS[family]) or DEFAULT_MODELS[family]
-    resolved_base = _first(base_url, entry.get("base_url") if entry else None,
-                           os.environ.get("HARNESS_BASE_URL"), legacy_base_env,
-                           DEFAULT_BASE_URLS[family])
-    resolved_key = _first(api_key, entry.get("api_key") if entry else None,
-                          api_key_from_env(family))
+    resolved_model = (
+        _first(
+            model,
+            entry_default,
+            spec_models[0] if spec_models else None,
+            os.environ.get("HARNESS_MODEL"),
+            legacy_model_env,
+            DEFAULT_MODELS[family],
+        )
+        or DEFAULT_MODELS[family]
+    )
+    resolved_base = _first(
+        base_url,
+        entry.get("base_url") if entry else None,
+        os.environ.get("HARNESS_BASE_URL"),
+        legacy_base_env,
+        DEFAULT_BASE_URLS[family],
+    )
+    resolved_key = _first(api_key, entry.get("api_key") if entry else None, api_key_from_env(family))
     extra = dict(entry.get("extra") or {}) if entry else {}
 
     return Provider(

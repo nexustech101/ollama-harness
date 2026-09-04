@@ -11,12 +11,12 @@ from pathlib import Path
 
 import pytest
 
+
 @pytest.fixture
 def harness(tmp_path: Path):
     from harness import Harness
 
-    return Harness(model="m", workspace=tmp_path, base_url="http://127.0.0.1:1",
-                   api_key="k", stream=False)
+    return Harness(model="m", workspace=tmp_path, base_url="http://127.0.0.1:1", api_key="k", stream=False)
 
 
 def _invoke(harness, name: str, **kwargs) -> str:
@@ -28,6 +28,7 @@ def _invoke(harness, name: str, **kwargs) -> str:
 # call_tool: dispatch, unknown tools, tool errors
 # ---------------------------------------------------------------------------
 
+
 def test_call_tool_dispatches_to_registered_tool(harness):
     out = harness.call_tool("file_info", {"path": "."})
     assert out.startswith("directory .")
@@ -37,12 +38,13 @@ def test_call_tool_reports_unknown_tool(harness, tmp_path: Path):
     (tmp_path / "a.txt").write_text("hi", encoding="utf-8")
     out = harness.call_tool("no_such_tool", {"path": "a.txt"})
     assert out.startswith("Error: unknown tool 'no_such_tool'")
-    assert "read_file" in out          # lists the available tools
+    assert "read_file" in out  # lists the available tools
 
 
 # ---------------------------------------------------------------------------
 # Permissions (approve): ask / deny / allow
 # ---------------------------------------------------------------------------
+
 
 def test_deny_mode_blocks_destructive_tools(harness):
     harness.mode = "deny"
@@ -78,6 +80,7 @@ def test_allow_mode_runs_destructive_tools(harness):
 # ---------------------------------------------------------------------------
 # Sub-agent file ownership
 # ---------------------------------------------------------------------------
+
 
 def test_ownership_blocks_outside_files(harness, tmp_path: Path):
     (tmp_path / "mine.txt").write_text("mine", encoding="utf-8")
@@ -118,6 +121,7 @@ def test_apply_patch_owned_target_applies(harness, tmp_path: Path):
 # System prompt and message trimming
 # ---------------------------------------------------------------------------
 
+
 def test_system_prompt_includes_environment(harness):
     prompt = harness.system_prompt()
     assert "Workspace root" in prompt
@@ -132,7 +136,7 @@ def test_trim_drops_orphan_tool_results(harness):
         harness.messages.append(HumanMessage(f"h{i}"))
         harness.messages.append(ToolMessage(content="r", tool_call_id=f"t{i}"))
     harness.trim(keep=10)
-    assert len(harness.messages) == 11          # system + 10 tail messages
+    assert len(harness.messages) == 11  # system + 10 tail messages
     assert not isinstance(harness.messages[1], ToolMessage)
 
 
@@ -148,6 +152,7 @@ def test_trim_is_noop_under_limit(harness):
 # write_targets: which files a tool call would modify
 # ---------------------------------------------------------------------------
 
+
 def test_write_targets_known_tools(harness):
     assert harness.write_targets("write_file", {"path": "x.py"}) == ["x.py"]
     assert harness.write_targets("git_restore", {"path": "y.py"}) == ["y.py"]
@@ -160,6 +165,7 @@ def test_write_targets_known_tools(harness):
 # ---------------------------------------------------------------------------
 # stats / usage plumbing
 # ---------------------------------------------------------------------------
+
 
 def test_usage_from_message_counts():
     from harness import usage_from
@@ -176,8 +182,7 @@ def test_usage_from_ollama_meta_fallback():
 
     class Msg:
         usage_metadata = None
-        response_metadata = {"prompt_eval_count": 7, "eval_count": 3,
-                             "eval_duration": 2_000_000_000}
+        response_metadata = {"prompt_eval_count": 7, "eval_count": 3, "eval_duration": 2_000_000_000}
 
     assert usage_from(Msg()) == {"input": 7, "output": 3, "eval_seconds": 2.0}
 
@@ -185,6 +190,7 @@ def test_usage_from_ollama_meta_fallback():
 # ---------------------------------------------------------------------------
 # formatting helpers used by the console and the API
 # ---------------------------------------------------------------------------
+
 
 def test_fmt_args_elides_long_values():
     from harness import fmt_args
@@ -211,6 +217,7 @@ def test_normalize_base_url_rewrites_bind_addresses():
 # ---------------------------------------------------------------------------
 # spawn_agent validation (no model backend needed for the guards)
 # ---------------------------------------------------------------------------
+
 
 def test_delegate_requires_files(harness):
     assert "list the files" in harness.delegate("task", [])
